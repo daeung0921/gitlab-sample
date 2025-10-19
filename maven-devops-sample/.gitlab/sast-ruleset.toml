@@ -1,0 +1,38 @@
+[semgrep]
+  description = 'semgrep custom rules configuration'
+  # targetdir where the custom configuration is assembled
+  targetdir = "/sgrules"
+  # Automatically check the validity of the files after applying file, url or
+  # raw passthroughs.
+  # Appropriate validator is inferred based on the file extension.
+  validate = true
+
+  #$ ls -1 /rules || true
+  #bandit.yml              # Python(Bandit 스타일)
+  #eslint.yml              # JS/TS 계열
+  #find_sec_bugs.yml       # Java/FindSecBugs
+  #find_sec_bugs_scala.yml # Scala/FindSecBugs
+  #flawfinder.yml          # C/C++
+  #gitlab
+  #gitlab_ce_python.yml    # Python
+  #gitlab_ce_scala.yml     # Scala
+  #gosec.yml               # Go
+  #lgpl                    # LGPL 라이선스 기반 규칙들
+  #lgpl-cc                 # CC(주로 CC-BY) 기반 규칙들
+  #manifest.json
+  #security_code_scan.yml  # .NET/C#
+
+  [[semgrep.passthrough]]
+    type  = "file"
+    # appending to an existing file
+    # this is the standard java ruleset we ship with our semgrep analyzer
+    mode  = "append"
+    target = "joinpath.yml"
+    value = "/rules/find_sec_bugs.yml"
+
+  [[semgrep.passthrough]]
+    type  = "file"
+    # appending to an existing file
+    mode  = "append"
+    target = "joinpath.yml"
+    value = "myrule.yml"

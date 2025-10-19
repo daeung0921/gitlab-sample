@@ -1,0 +1,14 @@
+[extend]
+path = "/gitleaks.toml"
+
+# 아래 추가 탐지
+# password = "mySuperSecret123"
+# passwd: 'admin123'
+# pwd => `letmein`
+
+[[rules]]
+  description = "Generic Password Rule"
+  id = "generic-password"
+  regex = '''(?i)(?:pwd|passwd|password)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|']|[\s|"]){0,3}(?:=|>|=:|:{1,3}=|\|\|:|<=|=>|:|\?=)(?:'|\"|\s|=|\x60){0,5}([0-9a-z\-_.=\S_]{3,50})(?:['|\"|\n|\r|\s|\x60|;]|$)'''
+  entropy = 3.5
+  keywords = ["pwd", "passwd", "password"]

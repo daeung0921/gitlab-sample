@@ -1,0 +1,111 @@
+include:
+  - project: platter-common/pipeline-templates
+    ref: main
+    file: /templates/workflows/java-spring.yml
+
+variables:
+  RELEASE_REPO: "maven-devops-releases/"
+  SNAPSHOT_REPO: "maven-devops-snapshots/" 
+  NEXUS_USER: "admin"
+  NEXUS_PASS: "changeme!!"
+  GROUP_ID: "com/example"
+  ARTIFACT_ID: "devops"
+  HOT_RELOAD: "true"
+  DEPLOY_USER: "gitlab"
+  DEPLOY_PASS: "gitlab"
+  WAS_URL: "13.124.131.170:8080"
+  CONTEXT_PATH: "/devops"
+  COMMIT_TAG: "$CI_COMMIT_TAG"
+  JIRA_TOKEN: ""
+
+build:
+  extends: 
+    - .maven_build
+    - .cache_strategy
+    - .mr_rules 
+  variables:
+    MAVEN_CLI_OPTS: "-B -DskipTests"
+
+jira_build_comment:
+  extends:
+    - .jira_comment
+    - .mr_rules
+  stage: build
+  needs:
+    - job: build
+      artifacts: true 
+  before_script:
+    - |
+      case "${BUILD_STATUS:-unknown}" in
+        success)
+          export JIRA_MESSAGE="$(printf '✅ Build passed\n• Artifact: build-artifact.zip\n• Pipeline: %s\n' "$CI_PIPELINE_URL")"
+          ;;
+        failed)
+          export JIRA_MESSAGE="$(printf '❌ Build failed\n• Pipeline: %s\n• Commit: %s\n• Trigger: %s\n' "$CI_PIPELINE_URL" "$CI_COMMIT_SHORT_SHA" "${GITLAB_USER_NAME:-runner}")"
+          ;;
+        *)
+          export JIRA_MESSAGE="$(printf 'ℹ️ Build status: %s\n• Pipeline: %s\n' "${BUILD_STATUS:-unknown}" "$CI_PIPELINE_URL")"
+          ;;
+      esac
+
+jira_build_attach:
+  extends:
+    - .jira_attach
+    - .mr_rules
+  stage: build 
+  needs:
+    - job: build
+      artifacts: true   # build-artifact.zip 받기
+    - job: jira_build_comment
+      artifacts: false
+  variables:
+    JIRA_ATTACH_FILE: "build-artifact.zip"
+
+test:
+  extends:
+    - .maven_test
+    - .cache_strategy
+    - .mr_rules
+
+package_snapshot:
+  extends: 
+    - .package_snapshot
+    - .cache_strategy
+    - .mr_rules
+
+package_release:
+  extends: 
+    - .package_release
+    - .cache_strategy
+    - .release_rules
+
+deploy_staging:
+  extends: 
+    - .deploy_war_staging
+    - .mr_rules
+
+deploy_prod:
+  stage: deploy
+  extends:
+    - .deploy_symlink  
+    - .release_rules 
+
+rollback_prod:
+  extends: 
+    - .rollback_symlink
+    - .release_rules
+
+#deploy_prod:
+#  stage: deploy
+#  extends:
+#    - .deploy_diff  
+#    - .release_rules 
+
+#approve_rollback:
+#  extends: 
+#    - .approve_rollback 
+
+#rollback_prod:
+#  extends: 
+#    - .rollback_diff_restore
+#    - .release_rules

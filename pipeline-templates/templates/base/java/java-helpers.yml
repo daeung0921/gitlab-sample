@@ -1,0 +1,2711 @@
+# ────────────────────────────────────────────────
+# fn_mvn_build 함수
+#   원격 서버(REMOTE_DEPLOY_HOST)에 SSH 접속하여 Maven 빌드 수행 후 산출물(zip) 다운로드
+#
+# ▶ 사용 방법:
+#   script:
+#     - !reference [.fn_mvn_build, script]
+#     - fn_mvn_build
+#
+# ▶ 제어용 환경 변수 목록:
+#   - REMOTE_DEPLOY_HOST   (필수) SSH 대상 서버 IP 또는 호스트명
+#   - REMOTE_DEPLOY_USER   (필수) SSH 접속 계정
+#   - REMOTE_DIR           (필수) 원격 빌드 작업 디렉토리 (/tmp/gitlab-build-$CI_PIPELINE_ID 등)
+#   - REMOTE_DEPLOY_PORT   (선택) SSH 포트, 기본값 22
+#   - REMOTE_SETTINGS      (선택) 원격 Maven settings.xml 경로
+#   - MAVEN_CLI_OPTS       (선택) Maven 옵션, 기본값 "-B"
+#                            예: "-B -DskipTests" 또는 "-B -Dmaven.test.skip=true"
+#   - BUILD_DIR            (선택) Maven 산출물 디렉토리, 기본값 "target"
+#   - ZIP_FILE             (선택) 원격 zip 파일명, 기본값 "build-artifact.zip"
+#   - LOCAL_ZIP_OUT        (선택) 로컬에 다운로드할 zip 파일명
+#   - CI_PROJECT_DIR       (선택) 로컬 소스 루트 (기본값 ".")
+#   - SSH_PRIVATE_KEY      (필수, Runner에 따라) SSH 개인키 (before_script에서 등록)
+#
+# ▶ 예시 (GitLab CI):
+#   variables:
+#     REMOTE_DEPLOY_HOST: "13.124.131.170"
+#     REMOTE_DEPLOY_USER: "gitlab-runner-user"
+#     REMOTE_DIR: "/tmp/gitlab-build-${CI_PIPELINE_ID}"
+#     MAVEN_CLI_OPTS: "-B -DskipTests=false"
+#   script:
+#     - !reference [.fn_mvn_build, script]
+#     - fn_mvn_build
+# ────────────────────────────────────────────────
+.fn_mvn_build:
+  script: |
+    fn_mvn_build() {
+      set -eu
+
+      ###############################################################
+      # 기본 설정
+      # - 이 함수는 로컬 CI 컨테이너 내에서 실행되어 원격 서버에
+      #   소스를 전송하고 SSH로 Maven 빌드를 수행한 뒤 산출물을 가져온다.
+      # - rsync가 양쪽 모두 설치되어 있으면 rsync 방식,
+      #   없으면 tar+ssh 스트리밍 폴백.
+      ###############################################################
+
+      # ──  환경 변수 초기화 (필요 시 CI/CD 변수로 override 가능) ─────────────────────────────────────────────
+      maven_cli_opts="${MAVEN_CLI_OPTS:-"-B"}"            # mvn 옵션 (기본: batch 모드)
+      build_dir="${BUILD_DIR:-"target"}"                  # 원격 빌드 결과 디렉토리 (예: target)
+      zip_file="${ZIP_FILE:-"build-artifact.zip"}"        # 원격 zip 파일명
+      remote_dir="${REMOTE_DIR:?REMOTE_DIR is required}"  # 원격 빌드 작업 디렉토리 (필수)
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"             # SSH 포트 (기본 22)
+      remote_settings="${REMOTE_SETTINGS:-""}"            # Maven settings.xml 경로 (옵션)
+      src_dir="${CI_PROJECT_DIR:-.}"                      # 로컬 소스 루트 경로
+
+      # ── SSH 접속 정보 확인 ─────────────────────────────────────────────
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+
+      # ── 내부 헬퍼 함수 ─────────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq() { printf "%s" "$1" | sed "s/'/'\\\\''/g"; } # shell-safe quoting for SSH (Alpine BusyBox 호환)
+
+      # ── 소스 동기화 (rsync 우선, 없으면 tar 스트리밍) ─────────────────────────────────────────────
+      log "▶ Sync sources to remote: $REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_dir"
+      if command -v rsync >/dev/null 2>&1 && \
+         ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" 'command -v rsync >/dev/null 2>&1'
+      then
+        RSYNC_EXCLUDES="--exclude=.git --exclude=.m2 --exclude=target --exclude=node_modules --exclude=.gradle"
+        log "Using rsync for efficient incremental sync"
+        rsync -az --delete \
+          -e "ssh -p $remote_port" \
+          --rsync-path="mkdir -p '$remote_dir' && rsync" \
+          $RSYNC_EXCLUDES \
+          "$src_dir/" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_dir/"
+      else
+        log "rsync not available, falling back to tar streaming"
+        tar -C "$src_dir" \
+            --exclude=".git" --exclude=".m2" --exclude="target" \
+            --exclude="node_modules" --exclude=".gradle" \
+            -czf - . \
+          | ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+              "mkdir -p '$remote_dir' && tar -xzf - -C '$remote_dir'"
+      fi
+
+      # ── 원격 빌드 스크립트 생성 ─────────────────────────────────────────────
+      remote_script=$(mktemp -t remote_build.XXXXXX)
+      log "Created temporary remote build script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -eu
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${BUILD_DIR:?BUILD_DIR is required}"
+      : "${ZIP_FILE:?ZIP_FILE is required}"
+      : "${MVN_OPTS:?MVN_OPTS is required}"
+
+      log "Starting remote Maven build in $REMOTE_DIR"
+
+      # 1> 작업 디렉토리 준비
+      mkdir -p "$REMOTE_DIR"
+      cd "$REMOTE_DIR"
+
+      # 2> Maven 프로젝트 유효성 확인
+      [ -f "pom.xml" ] || fail "pom.xml not found in $REMOTE_DIR (check source sync)"
+
+      # 3> zip 유틸 설치 (가능한 경우만 시도)
+      if ! command -v zip >/dev/null 2>&1; then
+        log "zip not found, attempting install..."
+        if command -v apk >/dev/null 2>&1; then sudo apk add --no-cache zip || true
+        elif command -v apt-get >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y zip || true
+        elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y zip || true
+        fi
+      fi
+
+      # 4> Maven 실행 준비
+      command -v mvn >/dev/null 2>&1 || fail "Maven not installed or not in PATH"
+      log "Using Maven: $(command -v mvn)"
+      log "Options    : $MVN_OPTS"
+      log "Remote dir : $REMOTE_DIR"
+
+      # 5> Maven 빌드 수행
+      log "▶ Running Maven build..."
+      if [ -n "${SETTINGS_XML:-}" ]; then
+        mvn $MVN_OPTS -s "$SETTINGS_XML" clean package
+      else
+        mvn $MVN_OPTS clean package
+      fi
+
+      [ -d "$BUILD_DIR" ] || fail "Build directory $BUILD_DIR not found after mvn package"
+      ok "Maven build success"
+
+      # 6> 산출물 패키징
+      ARTIFACT_DIR="$REMOTE_DIR/artifacts"
+      mkdir -p "$ARTIFACT_DIR"
+      rm -f "$ARTIFACT_DIR/$ZIP_FILE"
+
+      log "▶ Packaging artifacts..."
+      zip -r "$ARTIFACT_DIR/$ZIP_FILE" "$BUILD_DIR" >/dev/null || true
+
+      [ -s "$ARTIFACT_DIR/$ZIP_FILE" ] || fail "Artifact zip creation failed"
+      ok "Packaged: $ARTIFACT_DIR/$ZIP_FILE"
+    REMOTE_SH
+
+      # ── 원격 빌드 실행 ─────────────────────────────────────────────
+      log "▶ Executing remote build via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      #ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+      #  REMOTE_DIR="$remote_dir" \
+      #  BUILD_DIR="$build_dir" \
+      #  ZIP_FILE="$zip_file" \
+      #  MVN_OPTS='$maven_cli_opts' \
+      #  SETTINGS_XML="$remote_settings" \
+      #  'sh -s' < "$remote_script"
+
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$remote_dir")'" \
+        "BUILD_DIR='$(shq "$build_dir")'" \
+        "ZIP_FILE='$(shq "$zip_file")'" \
+        "MVN_OPTS='$(shq "$maven_cli_opts")'" \
+        "SETTINGS_XML='$(shq "$remote_settings")'" \
+        'export REMOTE_DIR BUILD_DIR ZIP_FILE MVN_OPTS SETTINGS_XML; sh -s' \
+        < "$remote_script"
+
+      # ── 산출물 다운로드 ─────────────────────────────────────────────
+      remote_zip="${remote_dir}/artifacts/${zip_file}"
+      local_zip="${LOCAL_ZIP_OUT:-$zip_file}"
+
+      log "▶ Downloading artifact: $remote_zip -> $local_zip"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip" "$local_zip"
+
+      ok "Done: artifact retrieved successfully ($local_zip)"
+
+      # ── 임시 파일 정리 ─────────────────────────────────────────────
+      rm -f "$remote_script" || true
+      log "Temporary script cleaned up: $remote_script"
+
+      # ── 원격 디렉토리 정리 (옵션) ─────────────────────────────────────────────
+      # ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" "rm -rf '$remote_dir'" || true
+    }
+
+# ────────────────────────────────────────────────
+# fn_mvn_test 함수
+#   원격 서버(REMOTE_DEPLOY_HOST)에 SSH 접속하여 Maven 테스트 수행 후
+#   Surefire + JaCoCo 리포트를 zip 형태로 다운로드
+#
+# ▶ 사용 방법:
+#   script:
+#     - !reference [.fn_mvn_test, script]
+#     - fn_mvn_test
+#
+# ▶ 제어용 환경 변수 목록:
+#   - REMOTE_DEPLOY_HOST   (필수) SSH 대상 서버 IP 또는 호스트명
+#   - REMOTE_DEPLOY_USER   (필수) SSH 접속 계정
+#   - REMOTE_DIR           (필수) 원격 작업 디렉토리 (/tmp/gitlab-test-$CI_PIPELINE_ID 등)
+#   - REMOTE_DEPLOY_PORT   (선택) SSH 포트, 기본값 22
+#   - REMOTE_SETTINGS      (선택) Maven settings.xml 경로
+#   - MAVEN_CLI_OPTS       (선택) Maven 옵션, 기본값 "-B"
+#   - REPORT_DIR           (선택) Surefire 리포트 경로, 기본값 "target/surefire-reports"
+#   - JACOCO_DIR           (선택) JaCoCo 리포트 경로, 기본값 "target/site/jacoco"
+#   - ZIP_FILE             (선택) zip 파일명, 기본값 "test-reports.zip"
+#   - ARTIFACT_DIR         (선택) 로컬에 저장할 디렉토리, 기본값 "$CI_PROJECT_DIR/artifacts"
+#   - SSH_PRIVATE_KEY      (필수, Runner에 따라) SSH 개인키 (before_script에서 등록)
+#
+# ▶ 예시 (GitLab CI):
+#   variables:
+#     REMOTE_DEPLOY_HOST: "13.124.131.170"
+#     REMOTE_DEPLOY_USER: "gitlab-runner-user"
+#     REMOTE_DIR: "/tmp/gitlab-test-${CI_PIPELINE_ID}"
+#     MAVEN_CLI_OPTS: "-B"
+#   script:
+#     - !reference [.fn_mvn_test, script]
+#     - fn_mvn_test
+# ────────────────────────────────────────────────
+.fn_mvn_test:
+  script: |
+    fn_mvn_test() {
+      set -eu
+
+      maven_cli_opts="${MAVEN_CLI_OPTS:-"-B"}"
+      report_dir="${REPORT_DIR:-"target/surefire-reports"}"
+      jacoco_dir="${JACOCO_DIR:-"target/site/jacoco"}"
+      artifact_dir="${ARTIFACT_DIR:-"$CI_PROJECT_DIR/artifacts"}"
+      zip_file="${ZIP_FILE:-"test-reports.zip"}"
+      remote_dir="${REMOTE_DIR:?REMOTE_DIR is required}"
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      remote_settings="${REMOTE_SETTINGS:-""}"
+      src_dir="${CI_PROJECT_DIR:-.}"
+
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq() { printf "%s" "$1" | sed "s/'/'\\\\''/g"; } # shell-safe quoting for SSH (Alpine BusyBox 호환)
+
+      log "▶ Syncing sources to remote: $REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_dir"
+      if command -v rsync >/dev/null 2>&1 && \
+         ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" 'command -v rsync >/dev/null 2>&1'
+      then
+        RSYNC_EXCLUDES="--exclude=.git --exclude=.m2 --exclude=target --exclude=node_modules --exclude=.gradle"
+        rsync -az --delete \
+          -e "ssh -p $remote_port" \
+          --rsync-path="mkdir -p '$remote_dir' && rsync" \
+          $RSYNC_EXCLUDES \
+          "$src_dir/" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_dir/"
+      else
+        tar -C "$src_dir" \
+            --exclude=".git" --exclude=".m2" --exclude="target" \
+            --exclude="node_modules" --exclude=".gradle" \
+            -czf - . \
+          | ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+              "mkdir -p '$remote_dir' && tar -xzf - -C '$remote_dir'"
+      fi
+
+      remote_script=$(mktemp -t remote_test.XXXXXX)
+      log "Created temporary remote test script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -eu
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${REPORT_DIR:?REPORT_DIR is required}"
+      : "${JACOCO_DIR:?JACOCO_DIR is required}"
+      : "${ZIP_FILE:?ZIP_FILE is required}"
+      : "${MVN_OPTS:?MVN_OPTS is required}"
+
+      mkdir -p "$REMOTE_DIR"
+      cd "$REMOTE_DIR"
+      [ -f "pom.xml" ] || fail "pom.xml not found"
+
+      command -v mvn >/dev/null 2>&1 || fail "Maven not installed"
+      log "Using Maven: $(command -v mvn)"
+      log "Options: $MVN_OPTS"
+
+      if [ -n "${SETTINGS_XML:-}" ]; then
+        mvn $MVN_OPTS -s "$SETTINGS_XML" test
+      else
+        mvn $MVN_OPTS test
+      fi
+      ok "Maven tests completed"
+
+      ARTIFACT_DIR="$REMOTE_DIR/artifacts"
+      mkdir -p "$ARTIFACT_DIR"
+      rm -f "$ARTIFACT_DIR/$ZIP_FILE"
+      zip -r "$ARTIFACT_DIR/$ZIP_FILE" "$REPORT_DIR" "$JACOCO_DIR" >/dev/null 2>&1 || true
+      [ -s "$ARTIFACT_DIR/$ZIP_FILE" ] || fail "Report zip creation failed"
+      ok "Packaged reports: $ARTIFACT_DIR/$ZIP_FILE"
+    REMOTE_SH
+
+      log "▶ Executing remote test via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$remote_dir")'" \
+        "REPORT_DIR='$(shq "$report_dir")'" \
+        "JACOCO_DIR='$(shq "$jacoco_dir")'" \
+        "ZIP_FILE='$(shq "$zip_file")'" \
+        "MVN_OPTS='$(shq "$maven_cli_opts")'" \
+        "SETTINGS_XML='$(shq "$remote_settings")'" \
+        'export REMOTE_DIR REPORT_DIR JACOCO_DIR ZIP_FILE MVN_OPTS SETTINGS_XML; sh -s' \
+        < "$remote_script"
+
+      remote_zip="${remote_dir}/artifacts/${zip_file}"
+      local_zip="${artifact_dir}/${zip_file}"
+      mkdir -p "$artifact_dir"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip" "$local_zip"
+      ok "Reports downloaded successfully: $local_zip"
+
+      rm -f "$remote_script" || true
+      log "Temporary script cleaned up: $remote_script"
+    }
+
+# ────────────────────────────────────────────────
+# fn_mvn_deploy_snapshot
+#   원격 서버에서 mvn clean deploy (snapshot) 실행 후
+#   배포 로그 + 산출물(WAR/JAR)을 zip으로 묶어 로컬로 다운로드
+#
+# ▶ 필요 변수
+#   - REMOTE_DEPLOY_HOST   (필수)
+#   - REMOTE_DEPLOY_USER   (필수)
+#   - REMOTE_DIR           (필수) 예: /tmp/gitlab-deploy-${CI_PIPELINE_ID}
+#   - SNAPSHOT_REPO_URL    (필수) 예: https://nexus.../maven-devops-snapshots/
+#   - REMOTE_DEPLOY_PORT   (선택, 기본 22)
+#   - MAVEN_CLI_OPTS       (선택, 기본 "-B")
+#   - REMOTE_SETTINGS      (선택) 원격 settings.xml 경로
+#   - CI_PROJECT_DIR       (선택, 기본 .) 로컬 소스 루트
+#
+# ▶ 결과물
+#   - 로컬: artifacts/deploy-snapshot-artifacts.zip
+# ────────────────────────────────────────────────
+.fn_mvn_deploy_snapshot:
+  script: |
+    fn_mvn_deploy_snapshot() {
+      set -eu
+
+      # ── 환경값 초기화 ─────────────────────────────────────────────
+      maven_cli_opts="${MAVEN_CLI_OPTS:-"-B"}"
+      remote_dir="${REMOTE_DIR:?REMOTE_DIR is required}"
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      remote_settings="${REMOTE_SETTINGS:-""}"
+      src_dir="${CI_PROJECT_DIR:-.}"
+      snapshot_repo_url="${SNAPSHOT_REPO_URL:?SNAPSHOT_REPO_URL is required}"
+
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+
+      # ── 유틸/로깅 ─────────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      # BusyBox/Alpine 호환 shell-quoting
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      # ── 1) 소스 동기화 ─────────────────────────────────────────────
+      log "▶ Sync sources to remote: $REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_dir"
+      if command -v rsync >/dev/null 2>&1 && \
+         ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" 'command -v rsync >/dev/null 2>&1'
+      then
+        RSYNC_EXCLUDES="--exclude=.git --exclude=.m2 --exclude=target --exclude=node_modules --exclude=.gradle"
+        rsync -az --delete \
+          -e "ssh -p $remote_port" \
+          --rsync-path="mkdir -p '$remote_dir' && rsync" \
+          $RSYNC_EXCLUDES \
+          "$src_dir/" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_dir/"
+      else
+        tar -C "$src_dir" \
+            --exclude=".git" --exclude=".m2" --exclude="target" \
+            --exclude="node_modules" --exclude=".gradle" \
+            -czf - . \
+          | ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+              "mkdir -p '$remote_dir' && tar -xzf - -C '$remote_dir'"
+      fi
+
+      # ── 2) 원격 스크립트 생성 ─────────────────────────────────────────────
+      remote_script=$(mktemp /tmp/remote_deploy.XXXXXX)
+      log "Created temporary remote deploy script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -eu
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${MVN_OPTS:?MVN_OPTS is required}"
+      : "${SNAPSHOT_REPO_URL:?SNAPSHOT_REPO_URL is required}"
+
+      ARTIFACTS_DIR="$REMOTE_DIR/artifacts"
+      DEPLOY_LOG="$ARTIFACTS_DIR/deploy-snapshot.log"
+
+      # 준비
+      mkdir -p "$REMOTE_DIR" "$ARTIFACTS_DIR"
+      cd "$REMOTE_DIR"
+      [ -f "pom.xml" ] || fail "pom.xml not found in $REMOTE_DIR"
+
+      # mvn 체크
+      command -v mvn >/dev/null 2>&1 || fail "Maven not installed"
+      log "Using Maven: $(command -v mvn)"
+      log "Options    : $MVN_OPTS"
+      log "Repo URL   : $SNAPSHOT_REPO_URL"
+
+      # 배포 실행
+      log "▶ Maven Deploy Snapshot"
+      if [ -n "${SETTINGS_XML:-}" ]; then
+        if ! mvn $MVN_OPTS -s "$SETTINGS_XML" clean deploy \
+              -DaltDeploymentRepository=nexus-snapshots::default::"$SNAPSHOT_REPO_URL" 2>&1 | tee "$DEPLOY_LOG"; then
+          fail "Maven deploy failed (see $DEPLOY_LOG)"
+        fi
+      else
+        if ! mvn $MVN_OPTS clean deploy \
+              -DaltDeploymentRepository=nexus-snapshots::default::"$SNAPSHOT_REPO_URL" 2>&1 | tee "$DEPLOY_LOG"; then
+          fail "Maven deploy failed (see $DEPLOY_LOG)"
+        fi
+      fi
+      ok "Maven snapshot deploy finished"
+
+      # 산출물 압축 (WAR/JAR + 로그)
+      OUT_ZIP="$ARTIFACTS_DIR/deploy-snapshot-artifacts.zip"
+      rm -f "$OUT_ZIP"
+      log "▶ Archiving deployed artifacts"
+      # glob이 비어도 실패하지 않도록 || true
+      zip -r "$OUT_ZIP" target/*.war target/*.jar "$DEPLOY_LOG" >/dev/null 2>&1 || true
+
+      [ -s "$OUT_ZIP" ] || fail "No deployment artifacts were archived"
+      ok "Packaged: $OUT_ZIP"
+    REMOTE_SH
+
+      # ── 3) 원격 배포 실행 (환경변수 안전 전달) ─────────────────────────────────────────────
+      log "▶ Executing remote deploy via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$remote_dir")'" \
+        "MVN_OPTS='$(shq "$maven_cli_opts")'" \
+        "SNAPSHOT_REPO_URL='$(shq "$snapshot_repo_url")'" \
+        "SETTINGS_XML='$(shq "$remote_settings")'" \
+        'export REMOTE_DIR MVN_OPTS SNAPSHOT_REPO_URL SETTINGS_XML; sh -s' \
+        < "$remote_script"
+
+      # ── 4) 산출물 다운로드 ─────────────────────────────────────────────
+      remote_zip="${remote_dir}/artifacts/deploy-snapshot-artifacts.zip"
+      local_dir="${CI_PROJECT_DIR:-.}/artifacts"
+      mkdir -p "$local_dir"
+      log "▶ Downloading artifact: $remote_zip -> $local_dir/"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip" "$local_dir/"
+
+      ok "Done: $local_dir/$(basename "$remote_zip")"
+
+      # ── 5) 임시 파일 정리 ─────────────────────────────────────────────
+      rm -f "$remote_script" || true
+      log "Temporary script cleaned up: $remote_script"
+    }
+
+# ────────────────────────────────────────────────
+# fn_mvn_deploy_release
+#   Git 태그(COMMIT_TAG)로 버전 설정 후,
+#   원격에서 Maven Release 배포 → zip 산출물 scp 회수
+#
+# ▶ 필수 변수
+#   - COMMIT_TAG            : 예) v1.2.3  (v 접두어 자동 제거)
+#   - RELEASE_REPO_URL      : 예) https://nexus.../repository/maven-devops-releases/
+#   - REMOTE_DEPLOY_HOST    : 원격 호스트
+#   - REMOTE_DEPLOY_USER    : 원격 계정
+#   - REMOTE_DIR            : 원격 작업 디렉토리
+#
+# ▶ 선택 변수
+#   - MAVEN_CLI_OPTS        : 기본 "-B"
+#   - REMOTE_DEPLOY_PORT    : 기본 22
+#   - REMOTE_SETTINGS       : 원격 settings.xml 경로(인증/미러 등)
+#   - CI_PROJECT_DIR        : 로컬 소스 루트(기본 .)
+# ────────────────────────────────────────────────
+.fn_mvn_deploy_release:
+  script: |
+    fn_mvn_deploy_release() {
+      set -eu
+
+      # ── 필수값 강제 ─────────────────────────────────────────────
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+
+      # ── 기본값 ────────────────────────────────────────────────
+      maven_cli_opts="${MAVEN_CLI_OPTS:-"-B"}"
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      remote_settings="${REMOTE_SETTINGS:-""}"
+      src_dir="${CI_PROJECT_DIR:-.}"
+
+      # ── 유틸 ─────────────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      # Alpine BusyBox 호환, 작은따옴표 안전 이스케이프
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      # ── 1) 소스 동기화 (rsync → tar 폴백) ─────────────────────
+      log "▶ Sync sources to remote: $REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$REMOTE_DIR"
+      if command -v rsync >/dev/null 2>&1 && \
+         ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" 'command -v rsync >/dev/null 2>&1'
+      then
+        rsync -az --delete \
+          -e "ssh -p $remote_port" \
+          --rsync-path="mkdir -p '$REMOTE_DIR' && rsync" \
+          --exclude=.git --exclude=.m2 --exclude=target --exclude=node_modules --exclude=.gradle \
+          "$src_dir/" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$REMOTE_DIR/"
+      else
+        tar -C "$src_dir" \
+            --exclude=".git" --exclude=".m2" --exclude="target" \
+            --exclude="node_modules" --exclude=".gradle" \
+            -czf - . \
+          | ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+              "mkdir -p '$REMOTE_DIR' && tar -xzf - -C '$REMOTE_DIR'"
+      fi
+
+      # ── 2) 원격 실행 스크립트 생성 ────────────────────────────
+      remote_script=$(mktemp /tmp/remote_release.XXXXXX)
+      log "Created temporary remote release script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -eu
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${MVN_OPTS:?MVN_OPTS is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+
+      ARTIFACTS_DIR="$REMOTE_DIR/artifacts"
+      DEPLOY_LOG="$ARTIFACTS_DIR/deploy-release.log"
+
+      mkdir -p "$REMOTE_DIR" "$ARTIFACTS_DIR"
+      cd "$REMOTE_DIR"
+      [ -f "pom.xml" ] || fail "pom.xml not found in $REMOTE_DIR"
+
+      command -v mvn >/dev/null 2>&1 || fail "Maven not installed"
+      log "Using Maven : $(command -v mvn)"
+      log "MVN_OPTS   : $MVN_OPTS"
+      log "Release URL: $RELEASE_REPO_URL"
+      log "COMMIT_TAG : $COMMIT_TAG"
+
+      # 2-1) 태그 → 버전 (v 접두어 제거)
+      NEW_VERSION="${COMMIT_TAG#v}"
+      [ -n "$NEW_VERSION" ] || fail "Resolved NEW_VERSION is empty"
+
+      log "▶ Setting version to $NEW_VERSION"
+      if [ -n "${SETTINGS_XML:-}" ]; then
+        mvn $MVN_OPTS -s "$SETTINGS_XML" versions:set -DnewVersion="$NEW_VERSION" -DgenerateBackupPoms=false 2>&1 | tee -a "$DEPLOY_LOG"
+      else
+        mvn $MVN_OPTS versions:set -DnewVersion="$NEW_VERSION" -DgenerateBackupPoms=false 2>&1 | tee -a "$DEPLOY_LOG"
+      fi
+
+      # 2-2) Release Deploy (신문법: id::url)
+      log "▶ Maven Deploy Release"
+      if [ -n "${SETTINGS_XML:-}" ]; then
+        mvn $MVN_OPTS -s "$SETTINGS_XML" clean deploy \
+          -DaltDeploymentRepository="nexus-releases::${RELEASE_REPO_URL}" 2>&1 | tee -a "$DEPLOY_LOG"
+      else
+        mvn $MVN_OPTS clean deploy \
+          -DaltDeploymentRepository="nexus-releases::${RELEASE_REPO_URL}" 2>&1 | tee -a "$DEPLOY_LOG"
+      fi
+      ok "Maven release deploy finished"
+
+      # 2-3) 산출물 압축 (WAR/JAR + 로그)
+      OUT_ZIP="$ARTIFACTS_DIR/deploy-release-artifacts.zip"
+      rm -f "$OUT_ZIP"
+      zip -r "$OUT_ZIP" target/*.war target/*.jar "$DEPLOY_LOG" >/dev/null 2>&1 || true
+      [ -s "$OUT_ZIP" ] || fail "No deployment artifacts were archived"
+      ok "Packaged: $OUT_ZIP"
+    REMOTE_SH
+
+      # ── 3) 원격 실행 (환경 안전 전달) ─────────────────────────
+      log "▶ Executing remote release via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "MVN_OPTS='$(shq "$maven_cli_opts")'" \
+        "RELEASE_REPO_URL='$(shq "$RELEASE_REPO_URL")'" \
+        "SETTINGS_XML='$(shq "$remote_settings")'" \
+        "COMMIT_TAG='$(shq "$COMMIT_TAG")'" \
+        'export REMOTE_DIR MVN_OPTS RELEASE_REPO_URL SETTINGS_XML COMMIT_TAG; sh -s' \
+        < "$remote_script"
+
+      # ── 4) 산출물 다운로드 (파일 경로 명시) ────────────────────
+      remote_zip="${REMOTE_DIR}/artifacts/deploy-release-artifacts.zip"
+      local_dir="${CI_PROJECT_DIR:-.}/artifacts"
+      mkdir -p "$local_dir"
+      local_file="$local_dir/$(basename "$remote_zip")"
+
+      log "▶ Downloading artifact: $remote_zip -> $local_file"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip" "$local_file"
+      ok "Done: $local_file"
+
+      # ── 5) 임시 파일 정리 ──────────────────────────────────────
+      rm -f "$remote_script" || true
+      log "Temporary script cleaned up: $remote_script"
+    }
+
+# ────────────────────────────────────────────────
+# fn_tomcat_deploy_war
+#   Nexus Releases에서 WAR 다운로드 → Tomcat Manager로 배포를
+#   "원격 서버(SSH)"에서 수행하고, 로그 zip을 Runner로 회수
+#
+# ▶ 필수 변수
+#   - REMOTE_DEPLOY_HOST      : SSH 대상 (배포 실행 호스트)  ex) 13.124.131.170
+#   - REMOTE_DEPLOY_USER      : SSH 계정                     ex) gitlab-runner-user
+#   - REMOTE_DIR              : 원격 작업 디렉토리           ex) /tmp/gitlab-prod-${CI_PIPELINE_ID}
+#   - RELEASE_REPO_URL        : Nexus Release repo base URL  ex) https://nexus.../repository/maven-devops-releases
+#   - GROUP_ID                : GAV groupId                  ex) com.example
+#   - ARTIFACT_ID             : GAV artifactId               ex) devops
+#   - COMMIT_TAG              : 태그(필수, v1.2.3 형식 가능)
+#   - WAS_URL                 : Tomcat Manager가 떠있는 호스트/IP (HTTP 베이스)
+#   - NEXUS_USER / NEXUS_PASS : Nexus 다운로드 계정
+#   - DEPLOY_USER/DEPLOY_PASS : Tomcat Manager 계정(배포 권한)
+#
+# ▶ 선택 변수
+#   - MAVEN_CLI_OPTS          : 미사용(참고용), 통일성 위해 남김
+#   - REMOTE_DEPLOY_PORT      : SSH 포트 (기본 22)
+#   - CONTEXT_PATH            : Tomcat context path (기본 /devops)
+# ────────────────────────────────────────────────
+.fn_tomcat_deploy_war:
+  script: |
+    fn_tomcat_deploy_war() {
+      set -eu
+
+      # ── 필수값 강제 ─────────────────────────────────────────────
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${WAS_URL:?WAS_URL is required}"
+      : "${NEXUS_USER:?NEXUS_USER is required}"
+      : "${NEXUS_PASS:?NEXUS_PASS is required}"
+      : "${DEPLOY_USER:?DEPLOY_USER is required}"
+      : "${DEPLOY_PASS:?DEPLOY_PASS is required}"
+
+      # ── 기본값 ────────────────────────────────────────────────
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      context_path="${CONTEXT_PATH:-/devops}"
+
+      # ── 유틸 ─────────────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      # Alpine BusyBox 호환, 작은따옴표 안전 이스케이프
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      # ── 1) 원격 스크립트 생성 ─────────────────────────────────
+      remote_script=$(mktemp /tmp/remote_deploy_prod.XXXXXX)
+      log "Created temporary remote prod deploy script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -eu
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${WAS_URL:?WAS_URL is required}"
+      : "${NEXUS_USER:?NEXUS_USER is required}"
+      : "${NEXUS_PASS:?NEXUS_PASS is required}"
+      : "${DEPLOY_USER:?DEPLOY_USER is required}"
+      : "${DEPLOY_PASS:?DEPLOY_PASS is required}"
+      : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+
+      ARTIFACTS_DIR="$REMOTE_DIR/artifacts"
+      DEPLOY_LOG="$ARTIFACTS_DIR/deploy-prod.log"
+
+      mkdir -p "$REMOTE_DIR" "$ARTIFACTS_DIR"
+      cd "$REMOTE_DIR"
+
+      # v 접두어 제거한 버전
+      VERSION="${COMMIT_TAG#v}"
+      [ -n "$VERSION" ] || fail "Resolved VERSION is empty"
+
+      WAR_FILE="${ARTIFACT_ID}-${VERSION}.war"
+      # groupId 의 점(.)을 / 로 치환
+      WAR_PATH="${GROUP_ID//.//}/${ARTIFACT_ID}/${VERSION}/${WAR_FILE}"
+
+      # RELEASE_REPO_URL 끝 슬래시 제거 후 구성
+      BASE="${RELEASE_REPO_URL%/}"
+      URL="${BASE}/${WAR_PATH}"
+
+      log "▶ Downloading WAR (artifact): ${ARTIFACT_ID}:${VERSION}"
+      # 민감정보는 로그에 직접 출력하지 않음
+      if ! curl -fsS --retry 3 -u "$NEXUS_USER:$NEXUS_PASS" -o "$WAR_FILE" "$URL" 2>&1 | tee -a "$DEPLOY_LOG"; then
+        fail "Failed to download WAR from $URL"
+      fi
+      [ -s "$WAR_FILE" ] || fail "Downloaded WAR is empty: $WAR_FILE"
+
+      log "▶ Deploying WAR to Tomcat PROD: http://$WAS_URL (context=$CONTEXT_PATH)"
+      # Tomcat Manager text API 사용, update=true
+      # ※ 로그에 자격증명 노출되지 않도록 주의 (curl 내부에서만 사용)
+      if ! curl -fsS --retry 3 -u "$DEPLOY_USER:$DEPLOY_PASS" \
+          -T "$WAR_FILE" \
+          "http://$WAS_URL/manager/text/deploy?path=$CONTEXT_PATH&update=true" 2>&1 | tee -a "$DEPLOY_LOG"; then
+        fail "Failed to deploy WAR to Tomcat Manager"
+      fi
+
+      ok "Tomcat deploy success"
+
+      # 로그만 압축(대형 WAR 회수는 불필요/비효율)
+      OUT_ZIP="$ARTIFACTS_DIR/deploy-war-artifacts.zip"
+      rm -f "$OUT_ZIP"
+      zip -r "$OUT_ZIP" "$DEPLOY_LOG" >/dev/null 2>&1 || true
+      [ -s "$OUT_ZIP" ] || fail "No deployment logs were archived"
+      ok "Packaged: $OUT_ZIP"
+    REMOTE_SH
+
+      # ── 2) 원격 실행 (환경 안전 전달) ─────────────────────────
+      log "▶ Executing prod deploy via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "RELEASE_REPO_URL='$(shq "$RELEASE_REPO_URL")'" \
+        "GROUP_ID='$(shq "$GROUP_ID")'" \
+        "ARTIFACT_ID='$(shq "$ARTIFACT_ID")'" \
+        "COMMIT_TAG='$(shq "$COMMIT_TAG")'" \
+        "WAS_URL='$(shq "$WAS_URL")'" \
+        "NEXUS_USER='$(shq "$NEXUS_USER")'" \
+        "NEXUS_PASS='$(shq "$NEXUS_PASS")'" \
+        "DEPLOY_USER='$(shq "$DEPLOY_USER")'" \
+        "DEPLOY_PASS='$(shq "$DEPLOY_PASS")'" \
+        "CONTEXT_PATH='$(shq "$context_path")'" \
+        'export REMOTE_DIR RELEASE_REPO_URL GROUP_ID ARTIFACT_ID COMMIT_TAG WAS_URL NEXUS_USER NEXUS_PASS DEPLOY_USER DEPLOY_PASS CONTEXT_PATH; sh -s' \
+        < "$remote_script"
+
+      # ── 3) 산출물 다운로드 (파일 경로 명시) ────────────────────
+      remote_zip="${REMOTE_DIR}/artifacts/deploy-war-artifacts.zip"
+      local_dir="${CI_PROJECT_DIR:-.}/artifacts"
+      mkdir -p "$local_dir"
+      local_file="$local_dir/$(basename "$remote_zip")"
+
+      log "▶ Downloading artifact: $remote_zip -> $local_file"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip" "$local_file"
+      ok "Done: $local_file"
+
+      # ── 4) 임시 파일 정리 ──────────────────────────────────────
+      rm -f "$remote_script" || true
+      log "Temporary script cleaned up: $remote_script"
+    }
+
+# ────────────────────────────────────────────────
+# 함수: fn_tomcat_deploy_snapshot_war
+#
+# 목적:
+#   - Nexus Snapshot 리포지토리에서 최신 SNAPSHOT WAR를 찾아
+#     Tomcat Manager API(update=true)로 스테이징/개발 서버에 “통배포”한다.
+#
+# 동작 개요:
+#   1) maven-metadata.xml(artifact 루트)에서 가장 최신 SNAPSHOT base 버전 선택 (예: 1.2.4-SNAPSHOT)
+#   2) 해당 버전 디렉토리의 maven-metadata.xml에서 snapshotVersions 중 확장자가 war인 최신 항목 선택
+#      - timestamped 네이밍(artifactId-1.2.4-20251016.090501-3.war) 지원
+#      - 없으면 non-unique 스냅샷(artifactId-1.2.4-SNAPSHOT.war)로 폴백
+#   3) WAR 다운로드 후 Tomcat Manager에 update=true로 배포
+#   4) 배포 로그를 zip으로 패키징하여 Runner로 회수
+#
+# 특징:
+#   - COMMIT_TAG 불필요 → 브랜치/MR 파이프라인에서 사용 용이
+#   - SNAPSHOT_VERSION 변수를 주면 해당 SNAPSHOT(base) 버전 강제 사용 가능 (예: 1.2.4-SNAPSHOT)
+#   - timestamped/ non-unique 모두 대응
+#
+# 필수 변수:
+#   REMOTE_DEPLOY_HOST, REMOTE_DEPLOY_USER, REMOTE_DIR,
+#   SNAPSHOT_REPO_URL, GROUP_ID, ARTIFACT_ID,
+#   WAS_URL, NEXUS_USER, NEXUS_PASS, DEPLOY_USER, DEPLOY_PASS
+#
+# 선택 변수:
+#   REMOTE_DEPLOY_PORT(기본 22), CONTEXT_PATH(기본 /devops),
+#   SNAPSHOT_VERSION(강제 base SNAPSHOT, 예: 1.2.4-SNAPSHOT)
+#
+# 아티팩트:
+#   artifacts/deploy-snapshot-war-artifacts.zip
+#     └─ deploy-snapshot.log
+# ────────────────────────────────────────────────
+.fn_tomcat_deploy_snapshot_war:
+  script: |
+    fn_tomcat_deploy_snapshot_war() {
+      set -eu
+
+      # ── 필수값 ───────────────────────────────────────────────
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${SNAPSHOT_REPO_URL:?SNAPSHOT_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      : "${WAS_URL:?WAS_URL is required}"
+      : "${NEXUS_USER:?NEXUS_USER is required}"
+      : "${NEXUS_PASS:?NEXUS_PASS is required}"
+      : "${DEPLOY_USER:?DEPLOY_USER is required}"
+      : "${DEPLOY_PASS:?DEPLOY_PASS is required}"
+
+      # ── 기본값 ───────────────────────────────────────────────
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      context_path="${CONTEXT_PATH:-/devops}"
+
+      # ── 유틸 ────────────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      # ── 원격 실행 스크립트 생성 ─────────────────────────────
+      remote_script=$(mktemp /tmp/remote_deploy_snapshot.XXXXXX)
+      log "Created temporary snapshot deploy script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -eu
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      need() { command -v "$1" >/dev/null 2>&1; }
+
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${SNAPSHOT_REPO_URL:?SNAPSHOT_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      : "${WAS_URL:?WAS_URL is required}"
+      : "${NEXUS_USER:?NEXUS_USER is required}"
+      : "${NEXUS_PASS:?NEXUS_PASS is required}"
+      : "${DEPLOY_USER:?DEPLOY_USER is required}"
+      : "${DEPLOY_PASS:?DEPLOY_PASS is required}"
+      : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+
+      # 도구 준비
+      for t in curl xmllint zip; do
+        if ! need "$t"; then
+          if   need apk; then sudo apk add --no-cache $t libxml2-utils || true
+          elif need apt-get; then sudo apt-get update -y && sudo apt-get install -y $t || true
+          elif need dnf; then sudo dnf install -y $t libxml2 || true
+          fi
+        fi
+      done
+      need curl || fail "curl not available"
+      need zip  || fail "zip not available"
+      need xmllint || fail "xmllint not available"
+
+      ARTIFACTS_DIR="$REMOTE_DIR/artifacts"
+      DEPLOY_LOG="$ARTIFACTS_DIR/deploy-snapshot.log"
+      mkdir -p "$REMOTE_DIR" "$ARTIFACTS_DIR"
+      cd "$REMOTE_DIR"
+
+      BASE="${SNAPSHOT_REPO_URL%/}/${GROUP_ID//.//}/${ARTIFACT_ID}"
+
+      # 1) base SNAPSHOT 버전 결정 (우선순위: SNAPSHOT_VERSION 변수 → metadata 최신)
+      BASE_SNAP="${SNAPSHOT_VERSION:-}"
+      if [ -z "$BASE_SNAP" ]; then
+        log "Resolve latest SNAPSHOT base version from artifact metadata"
+        tmp_meta="$(mktemp)"
+        if ! curl -fsS --insecure -u "$NEXUS_USER:$NEXUS_PASS" -o "$tmp_meta" "$BASE/maven-metadata.xml" 2>&1 | tee -a "$DEPLOY_LOG"; then
+          fail "Failed to fetch artifact metadata"
+        fi
+        # versions 목록 중 -SNAPSHOT 로 끝나는 것 중 최댓값 선택
+        BASE_SNAP="$(xmllint --xpath "string(//versioning/versions/version[contains(., '-SNAPSHOT')][last()])" "$tmp_meta" 2>>"$DEPLOY_LOG" || true)"
+        rm -f "$tmp_meta"
+        [ -n "$BASE_SNAP" ] || fail "No SNAPSHOT versions found in metadata"
+      fi
+      log "BASE_SNAPSHOT=$BASE_SNAP" | tee -a "$DEPLOY_LOG"
+
+      # 2) version 디렉토리 메타에서 timestamped snapshot WAR 탐색
+      ver_meta="$(mktemp)"
+      if ! curl -fsS --insecure -u "$NEXUS_USER:$NEXUS_PASS" -o "$ver_meta" "$BASE/$BASE_SNAP/maven-metadata.xml" 2>&1 | tee -a "$DEPLOY_LOG"; then
+        fail "Failed to fetch version metadata for $BASE_SNAP"
+      fi
+
+      # snapshotVersions 섹션에서 extension='war'인 최신 값을 찾는다
+      SNAP_NAME="$(xmllint --xpath "string(//snapshotVersions/snapshotVersion[extension='war']/value[last()])" "$ver_meta" 2>>"$DEPLOY_LOG" || true)"
+      rm -f "$ver_meta"
+
+      WAR_URL=""
+      WAR_FILE=""
+
+      if [ -n "$SNAP_NAME" ]; then
+        # timestamped 네이밍 (ex: devops-1.2.4-20251016.090501-3.war)
+        WAR_FILE="${ARTIFACT_ID}-${SNAP_NAME}.war"
+        WAR_URL="${BASE}/${BASE_SNAP}/${WAR_FILE}"
+        log "Resolved timestamped snapshot: $WAR_FILE" | tee -a "$DEPLOY_LOG"
+      else
+        # non-unique 스냅샷으로 폴백 (ex: devops-1.2.4-SNAPSHOT.war)
+        WAR_FILE="${ARTIFACT_ID}-${BASE_SNAP}.war"
+        WAR_URL="${BASE}/${BASE_SNAP}/${WAR_FILE}"
+        log "No snapshotVersions entry; fallback to non-unique: $WAR_FILE" | tee -a "$DEPLOY_LOG"
+      fi
+
+      log "▶ Downloading SNAPSHOT WAR: $WAR_URL"
+      if ! curl -fsS --insecure --retry 3 -u "$NEXUS_USER:$NEXUS_PASS" -o "$WAR_FILE" "$WAR_URL" 2>&1 | tee -a "$DEPLOY_LOG"; then
+        fail "Failed to download WAR"
+      fi
+      [ -s "$WAR_FILE" ] || fail "Downloaded WAR is empty"
+
+      log "▶ Deploying to Tomcat: http://$WAS_URL (context=$CONTEXT_PATH)"
+      if ! curl -fsS --insecure --retry 3 -u "$DEPLOY_USER:$DEPLOY_PASS" \
+            -T "$WAR_FILE" \
+            "http://$WAS_URL/manager/text/deploy?path=$CONTEXT_PATH&update=true" 2>&1 | tee -a "$DEPLOY_LOG"; then
+        fail "Tomcat deploy failed"
+      fi
+      ok "Tomcat snapshot deploy success"
+
+      # 로그 압축
+      OUT_ZIP="$ARTIFACTS_DIR/deploy-snapshot-war-artifacts.zip"
+      rm -f "$OUT_ZIP"
+      zip -r "$OUT_ZIP" "$DEPLOY_LOG" >/dev/null 2>&1 || true
+      [ -s "$OUT_ZIP" ] || fail "No deployment logs were archived"
+      ok "Packaged: $OUT_ZIP"
+    REMOTE_SH
+
+      # ── 원격 실행 ────────────────────────────────────────────
+      log "▶ Executing snapshot deploy via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "SNAPSHOT_REPO_URL='$(shq "$SNAPSHOT_REPO_URL")'" \
+        "GROUP_ID='$(shq "$GROUP_ID")'" \
+        "ARTIFACT_ID='$(shq "$ARTIFACT_ID")'" \
+        "WAS_URL='$(shq "$WAS_URL")'" \
+        "NEXUS_USER='$(shq "$NEXUS_USER")'" \
+        "NEXUS_PASS='$(shq "$NEXUS_PASS")'" \
+        "DEPLOY_USER='$(shq "$DEPLOY_USER")'" \
+        "DEPLOY_PASS='$(shq "$DEPLOY_PASS")'" \
+        "CONTEXT_PATH='$(shq "$context_path")'" \
+        "SNAPSHOT_VERSION='$(shq "${SNAPSHOT_VERSION:-}")'" \
+        'export REMOTE_DIR SNAPSHOT_REPO_URL GROUP_ID ARTIFACT_ID WAS_URL NEXUS_USER NEXUS_PASS DEPLOY_USER DEPLOY_PASS CONTEXT_PATH SNAPSHOT_VERSION; sh -s' \
+        < "$remote_script"
+
+      # ── 산출물 다운로드 ──────────────────────────────────────
+      remote_zip="${REMOTE_DIR}/artifacts/deploy-snapshot-war-artifacts.zip"
+      local_dir="${CI_PROJECT_DIR:-.}/artifacts"
+      mkdir -p "$local_dir"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip" "$local_dir/"
+      ok "Done: $local_dir/$(basename "$remote_zip")"
+
+      # ── 정리 ─────────────────────────────────────────────────
+      rm -f "$remote_script" || true
+      log "Temporary script cleaned up: $remote_script"
+    }
+ 
+# ────────────────────────────────────────────────
+# fn_tomcat_rollback_war
+#   현재 태그(CI_COMMIT_TAG 또는 COMMIT_TAG)의 "직전 릴리즈 버전"을
+#   Nexus metadata로 조회 → 원격에서 WAR 다운로드 → Tomcat War 롤백 배포
+#
+# ▶ 필수 변수
+#   - REMOTE_DEPLOY_HOST   : SSH 대상 원격 호스트
+#   - REMOTE_DEPLOY_USER   : SSH 계정
+#   - REMOTE_DIR           : 원격 작업 디렉토리 (/tmp/gitlab-rollback-${CI_PIPELINE_ID} 등)
+#   - RELEASE_REPO_URL     : Nexus Releases base URL (예: https://nexus.../repository/maven-devops-releases)
+#   - GROUP_ID             : 예) com.example
+#   - ARTIFACT_ID          : 예) devops
+#   - COMMIT_TAG           : 현재 배포 태그 (예: v1.2.3)  ※ v 접두어는 원격에서 제거
+#   - WAS_URL            : Tomcat Manager 호스트:포트  (예: prod.example.com:8080)
+#   - NEXUS_USER / NEXUS_PASS : Nexus 접근 계정
+#   - DEPLOY_USER / DEPLOY_PASS : Tomcat Manager 배포 계정
+#
+# ▶ 선택 변수
+#   - REMOTE_DEPLOY_PORT   : 기본 22
+#   - CONTEXT_PATH         : 기본 "/devops"
+# ────────────────────────────────────────────────
+.fn_tomcat_rollback_war:
+  script: |
+    fn_tomcat_rollback_war() {
+      set -eu
+
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${WAS_URL:?WAS_URL is required}"
+      : "${NEXUS_USER:?NEXUS_USER is required}"
+      : "${NEXUS_PASS:?NEXUS_PASS is required}"
+      : "${DEPLOY_USER:?DEPLOY_USER is required}"
+      : "${DEPLOY_PASS:?DEPLOY_PASS is required}"
+
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      context_path="${CONTEXT_PATH:-/devops}"
+
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      remote_script=$(mktemp /tmp/remote_rollback_prod.XXXXXX)
+      log "Created temporary remote rollback script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -eu
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${WAS_URL:?WAS_URL is required}"
+      : "${NEXUS_USER:?NEXUS_USER is required}"
+      : "${NEXUS_PASS:?NEXUS_PASS is required}"
+      : "${DEPLOY_USER:?DEPLOY_USER is required}"
+      : "${DEPLOY_PASS:?DEPLOY_PASS is required}"
+      : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+
+      ARTIFACTS_DIR="$REMOTE_DIR/artifacts"
+      ROLLBACK_LOG="$ARTIFACTS_DIR/rollback-prod.log"
+
+      mkdir -p "$REMOTE_DIR" "$ARTIFACTS_DIR"
+      cd "$REMOTE_DIR"
+
+      # ── 도구 준비 ─────────────────────────────────────────────────
+      need() { command -v "$1" >/dev/null 2>&1; }
+      if ! need curl; then
+        if   need apk;      then sudo apk add --no-cache curl || true
+        elif need apt-get;  then sudo apt-get update -y && sudo apt-get install -y curl || true
+        elif need dnf;      then sudo dnf install -y curl || true
+        fi
+      fi
+      if ! need xmllint; then
+        if   need apk;      then sudo apk add --no-cache libxml2-utils || true
+        elif need apt-get;  then sudo apt-get update -y && sudo apt-get install -y libxml2-utils || true
+        elif need dnf;      then sudo dnf install -y libxml2 || true
+        fi
+      fi
+      if ! need zip; then
+        if   need apk;      then sudo apk add --no-cache zip || true
+        elif need apt-get;  then sudo apt-get update -y && sudo apt-get install -y zip || true
+        elif need dnf;      then sudo dnf install -y zip || true
+        fi
+      fi
+      command -v curl >/dev/null 2>&1    || fail "curl not available"
+      command -v xmllint >/dev/null 2>&1 || fail "xmllint not available"
+      command -v zip >/dev/null 2>&1     || fail "zip not available"
+
+      CUR_VERSION="${COMMIT_TAG#v}"
+      [ -n "$CUR_VERSION" ] || fail "Resolved version from COMMIT_TAG is empty"
+
+      META_URL="${RELEASE_REPO_URL%/}/${GROUP_ID//.//}/${ARTIFACT_ID}/maven-metadata.xml"
+
+      # 숫자 비교 (a<b:-1, a==b:0, a>b:1)
+      ver_cmp() {
+        awk -v A="$1" -v B="$2" '
+        function splitv(s, arr,   n,i) {
+          n=split(s, arr, ".")
+          for(i=1;i<=n;i++) if (arr[i] ~ /^[0-9]+$/) arr[i]+=0; else arr[i]=0
+          return n
+        }
+        BEGIN{
+          na=splitv(A, a); nb=splitv(B, b);
+          n = (na>nb?na:nb)
+          for(i=1;i<=n;i++){
+            va = (i<=na)?a[i]:0
+            vb = (i<=nb)?b[i]:0
+            if (va<vb){print -1; exit}
+            if (va>vb){print 1;  exit}
+          }
+          print 0
+        }'
+      }
+
+      # prev 버전 해석 함수 (stdout에는 버전 1줄만)
+      resolve_prev_version() {
+        tmpfile="$(mktemp)"
+        versions_tmp="$(mktemp)"
+        trap 'rm -f "$tmpfile" "$versions_tmp"' RETURN
+
+        # 로그는 stderr와 파일로만 남김
+        log "▶ Fetching metadata: $META_URL" >&2
+        if ! curl -fsS -u "$NEXUS_USER:$NEXUS_PASS" "$META_URL" -o "$tmpfile" >>"$ROLLBACK_LOG" 2>&1; then
+          return 1
+        fi
+
+        if ! xmllint --xpath "//versioning/versions/version" "$tmpfile" 2>>"$ROLLBACK_LOG" \
+          | sed -E 's#<version>#\n#g; s#</version>##g' \
+          | sed '/^\s*$/d' \
+          | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' > "$versions_tmp"; then
+          return 1
+        fi
+
+        log "Available versions (as-is order):" >&2
+        sed 's/^/  - /' "$versions_tmp" >&2
+
+        # 1) 정확 일치 시 직전 항목 선택
+        prev=""
+        last=""
+        found=0
+        while IFS= read -r v; do
+          [ -n "$v" ] || continue
+          if [ "$v" = "$CUR_VERSION" ]; then
+            found=1
+            [ -n "$last" ] && prev="$last"
+            break
+          fi
+          last="$v"
+        done < "$versions_tmp"
+
+        # 2) 매칭 실패 시, CUR_VERSION 보다 작은 값 중 최댓값 선택
+        if [ "$found" -ne 1 ] || [ -z "$prev" ]; then
+          prev=""
+          while IFS= read -r v; do
+            [ -n "$v" ] || continue
+            cmp_cur="$(ver_cmp "$v" "$CUR_VERSION")"   # v ? cur
+            if [ "$cmp_cur" -lt 0 ]; then              # v < cur
+              if [ -z "$prev" ]; then
+                prev="$v"
+              else
+                cmp_prev="$(ver_cmp "$v" "$prev")"
+                [ "$cmp_prev" -gt 0 ] && prev="$v"     # v > prev
+              fi
+            fi
+          done < "$versions_tmp"
+        fi
+
+        [ -n "$prev" ] || return 1
+        printf '%s\n' "$prev"   # stdout에는 버전만 1줄
+      }
+
+      # ── 재시도 루프: 30초 간격, 최대 5회 ───────────────────────────
+      attempt=1
+      max_attempts=5
+      sleep_secs=30
+      RESOLVED_PREV=""
+
+      while [ $attempt -le $max_attempts ]; do
+        log "▶ Resolve previous version (attempt $attempt/$max_attempts)"
+        RESOLVED_PREV="$(resolve_prev_version 2>>"$ROLLBACK_LOG" | head -n1 | tr -d ' \t\r')"
+        if [ -n "$RESOLVED_PREV" ]; then
+          # 숫자.점 이외 문자가 섞였는지 방어
+          case "$RESOLVED_PREV" in
+            ''|*[!0-9.]*)
+              log "Resolved previous version looks invalid: '$RESOLVED_PREV'" >&2
+              RESOLVED_PREV=""
+              ;;
+          esac
+        fi
+        if [ -n "$RESOLVED_PREV" ]; then
+          log "▶ Previous version resolved: $RESOLVED_PREV"
+          break
+        fi
+        if [ $attempt -lt $max_attempts ]; then
+          log "Previous version not found yet. Retry in ${sleep_secs}s..."
+          sleep $sleep_secs
+        fi
+        attempt=$((attempt+1))
+      done
+
+      [ -n "$RESOLVED_PREV" ] || fail "No previous version could be resolved after $max_attempts attempts"
+
+      # ── WAR 다운로드 및 배포 ───────────────────────────────────────
+      WAR_FILE="${ARTIFACT_ID}-${RESOLVED_PREV}.war"
+      WAR_PATH="${GROUP_ID//.//}/${ARTIFACT_ID}/${RESOLVED_PREV}/${WAR_FILE}"
+      BASE="${RELEASE_REPO_URL%/}"
+      WAR_URL="${BASE}/${WAR_PATH}"
+
+      log "▶ Downloading WAR: ${ARTIFACT_ID}:${RESOLVED_PREV}"
+      if ! curl -fsS --retry 3 -u "$NEXUS_USER:$NEXUS_PASS" -o "$WAR_FILE" "$WAR_URL" >>"$ROLLBACK_LOG" 2>&1; then
+        fail "Failed to download WAR from $WAR_URL"
+      fi
+      [ -s "$WAR_FILE" ] || fail "Downloaded WAR is empty: $WAR_FILE"
+
+      log "▶ Deploying WAR to Tomcat PROD: http://$WAS_URL (context=$CONTEXT_PATH)"
+      if ! curl -fsS --retry 3 -u "$DEPLOY_USER:$DEPLOY_PASS" \
+          -T "$WAR_FILE" \
+          "http://$WAS_URL/manager/text/deploy?path=$CONTEXT_PATH&update=true" >>"$ROLLBACK_LOG" 2>&1; then
+        fail "Failed to deploy WAR to Tomcat Manager"
+      fi
+
+      ok "Rollback deploy success"
+
+      OUT_ZIP="$ARTIFACTS_DIR/rollback-prod-artifacts.zip"
+      rm -f "$OUT_ZIP"
+      zip -r "$OUT_ZIP" "$ROLLBACK_LOG" >/dev/null 2>&1 || true
+      [ -s "$OUT_ZIP" ] || fail "No rollback logs were archived"
+      ok "Packaged: $OUT_ZIP"
+    REMOTE_SH
+
+      log "▶ Executing rollback via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "RELEASE_REPO_URL='$(shq "$RELEASE_REPO_URL")'" \
+        "GROUP_ID='$(shq "$GROUP_ID")'" \
+        "ARTIFACT_ID='$(shq "$ARTIFACT_ID")'" \
+        "COMMIT_TAG='$(shq "$COMMIT_TAG")'" \
+        "WAS_URL='$(shq "$WAS_URL")'" \
+        "NEXUS_USER='$(shq "$NEXUS_USER")'" \
+        "NEXUS_PASS='$(shq "$NEXUS_PASS")'" \
+        "DEPLOY_USER='$(shq "$DEPLOY_USER")'" \
+        "DEPLOY_PASS='$(shq "$DEPLOY_PASS")'" \
+        "CONTEXT_PATH='$(shq "$context_path")'" \
+        'export REMOTE_DIR RELEASE_REPO_URL GROUP_ID ARTIFACT_ID COMMIT_TAG WAS_URL NEXUS_USER NEXUS_PASS DEPLOY_USER DEPLOY_PASS CONTEXT_PATH; sh -s' \
+        < "$remote_script"
+
+      remote_zip="${REMOTE_DIR}/artifacts/rollback-prod-artifacts.zip"
+      local_dir="${CI_PROJECT_DIR:-.}/artifacts"
+      mkdir -p "$local_dir"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip" "$local_dir/"
+
+      rm -f "$remote_script" || true
+      ok "Rollback finished"
+    }
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 함수: fn_tomcat_diff_deploy
+#
+# 목적:
+#   - Tomcat 운영 서버의 “LIVE exploded directory”를 기준으로 증분(diff) 배포를 수행한다.
+#   - Nexus에서 새 WAR 파일(NEW_VERSION)을 다운로드하여 기존 LIVE와 비교한 뒤,
+#     변경된 파일만 반영(rsync or diff 기반)하며, 배포 전에는 LIVE 전체 백업을 자동 생성한다.
+#   - 배포 완료 후 헬스체크를 수행하고, 실패 시 즉시 직전 백업으로 자동 롤백한다.
+#
+# 배경:
+#   - 기존 full-deploy(WAR 전체 교체)는 downtime 및 rollback 부담이 크므로,
+#     실제 LIVE 디렉토리 구조를 기준으로 증분 배포(diff deploy)를 수행한다.
+#   - Nexus는 배포용 artifact 저장소로만 사용되며, SSH는 원격 명령 실행에만 사용된다.
+#
+# 주요 특징:
+#   1. 기준점: /opt/tomcat/webapps/<APP_NAME> (LIVE exploded 디렉토리)
+#   2. 비교방식: rsync --dry-run 기반 (rsync 미존재 시 diff -qr fallback)
+#   3. 백업정책: /var/backups/tomcat/<APP_NAME>/diff-backup-*.tar.gz
+#        - 자동 생성 (timestamp 포함)
+#        - 최신 백업 링크(diff-backup-latest.tar.gz) 자동 갱신
+#   4. 변경파일 반영: rsync --files-from=changed-files.txt (or cp -fp)
+#   5. 서비스 반영: Tomcat reload (manager API) or restart (systemctl)
+#   6. 헬스체크: actuator/page/none 모드 + HEALTH_URL_OVERRIDE 지원
+#        - actuator: /<APP>/actuator/health
+#        - page: /<APP>/
+#        - none: 스킵
+#   7. 헬스 실패 시: 직전 백업으로 즉시 자동 복구 + 파이프라인 실패 처리
+#
+# 폴더 구조:
+#   배포 전/후 공통: 운영 서버의 기준 경로
+#   /opt/tomcat/
+#   └── webapps/
+#       └── devops/                       ← LIVE exploded 디렉터리(실제 폴더, 심링크 아님)
+#           ├── WEB-INF/                  ← 기존 운영 중인 파일들이 들어 있음
+#           ├── static/
+#           ├── index.jsp
+#           └── ...                      
+# 
+#   GitLab Runner가 SSH로 접속해 사용하는 원격 작업공간(파이프라인별)
+#   /tmp/gitlab-build-<PIPELINE_ID>/
+#   ├── unzip-new/                        ← Nexus에서 받은 NEW WAR unzip 결과
+#   │   ├── WEB-INF/
+#   │   ├── static/
+#   │   └── ...
+#   └── artifacts/
+#       ├── diff-deploy-artifacts.zip     ← (로그+변경목록+.env) 결과물
+#       ├── diff-deploy.log
+#       └── changed-files.txt
+# 
+#   LIVE 전체 백업 보관 위치(자동 회전)
+#   /var/backups/tomcat/
+#   └── devops/
+#       ├── diff-backup-devops-1.4.0-20251018141233.tar.gz
+#       ├── diff-backup-devops-1.4.1-20251019101822.tar.gz
+#       └── diff-backup-latest.tar.gz -> diff-backup-devops-1.4.1-20251019101822.tar.gz
+#         ↑ 배포 직전에 생성되는 최신 백업(심볼릭 링크)
+# 
+# 주요 단계:
+# GitLab Runner
+#   │
+#   ├─ SSH 접속
+#   │
+#   ▼
+# Tomcat Server (/opt/tomcat/webapps/<APP>)
+#   │
+#   ├─ (1) Nexus에서 NEW WAR 다운로드 (curl)
+#   │       → unzip → /tmp/unzip-new
+#   │
+#   ├─ (2) LIVE_DIR ↔ NEW_DIR 변경 비교
+#   │       rsync dry-run → changed-files.txt
+#   │
+#   ├─ (3) LIVE 전체 백업 (tar.gz)
+#   │       /var/backups/tomcat/<APP>/
+#   │
+#   ├─ (4) 변경 파일만 LIVE에 반영
+#   │       rsync -av --files-from=changed-files.txt
+#   │
+#   ├─ (5) Tomcat reload or restart
+#   │
+#   └─ (6) 결과 zip 회수
+#         artifacts/diff-deploy-artifacts.zip
+#
+# 산출물:
+#   - $REMOTE_DIR/artifacts/diff-deploy-artifacts.zip
+#       ├── diff-deploy.log
+#       ├── changed-files.txt
+#       └── .env (CHANGED, BACKUP_FILE, ROLLED_BACK_FROM 등)
+#
+# 사용 예시:
+#   deploy_prod_diff:
+#     stage: deploy
+#     script:
+#       - !reference [.fn_tomcat_diff_deploy, script]
+#       - fn_tomcat_diff_deploy
+#
+# 필수 변수:
+#   REMOTE_DEPLOY_HOST, REMOTE_DEPLOY_USER, REMOTE_DIR,
+#   RELEASE_REPO_URL, GROUP_ID, ARTIFACT_ID,
+#   COMMIT_TAG, WAS_URL, NEXUS_USER, NEXUS_PASS, CONTEXT_PATH
+#
+# 선택/기본 변수:
+#   REMOTE_DEPLOY_PORT=22
+#   TOMCAT_WEBAPPS_DIR=/opt/tomcat/webapps
+#   DIFF_USE_RSYNC=true
+#   DIFF_HOT_RELOAD=false
+#   DEPLOY_USER, DEPLOY_PASS (Tomcat manager 계정)
+#   DEPLOY_LOG_NAME=diff-deploy.log
+#   DIFF_BACKUP_DIR=/var/backups/tomcat
+#   DIFF_BACKUP_PREFIX=diff-backup
+#
+# 헬스체크 변수(선택):
+#   HEALTH_MODE=actuator|page|none
+#   HEALTH_URL_OVERRIDE=""
+#   HEALTHCHECK_TIMEOUT=60
+#   HEALTHCHECK_INTERVAL=2
+#
+# 자동 롤백 관련:
+#   - 배포 실패 시 백업으로 즉시 복원
+#   - 복원 성공 후 파이프라인은 실패 처리 (fail)
+#   - 복원 로그 및 백업 경로는 .env에 기록
+# ───────────────────────────────────────────────────────────────────────────────
+.fn_tomcat_diff_deploy:
+  script: |
+    fn_tomcat_diff_deploy() {
+      set -eu
+
+      # ── 필수값 ───────────────────────────────────────────
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"     # NEW 버전 기준
+      : "${WAS_URL:?WAS_URL is required}"
+      : "${NEXUS_USER:?NEXUS_USER is required}"
+      : "${NEXUS_PASS:?NEXUS_PASS is required}"
+      : "${CONTEXT_PATH:?CONTEXT_PATH is required}" # 예: /devops
+
+      # ── 기본값/옵션 ──────────────────────────────────────
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      webapps_root="${TOMCAT_WEBAPPS_DIR:-/opt/tomcat/webapps}"
+      use_rsync="${DIFF_USE_RSYNC:-true}"
+      hot_reload="${DIFF_HOT_RELOAD:-false}"
+      deploy_log_name="${DEPLOY_LOG_NAME:-diff-deploy.log}"
+      backup_dir_default="/var/backups/tomcat"
+      backup_root="${DIFF_BACKUP_DIR:-$backup_dir_default}"
+
+      # 헬스체크 옵션(선택)
+      health_mode="${HEALTH_MODE:-actuator}"               # actuator|page|none
+      health_url_override="${HEALTH_URL_OVERRIDE:-}"       # 지정 시 최우선
+      hc_timeout="${HEALTHCHECK_TIMEOUT:-60}"
+      hc_interval="${HEALTHCHECK_INTERVAL:-2}"
+
+      # ── 유틸 ────────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      # ── 원격 스크립트 생성 ─────────────────────────────
+      remote_script=$(mktemp /tmp/remote_diff_deploy_live.XXXXXX)
+      log "Created temporary diff deploy script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -eu
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      need() { command -v "$1" >/dev/null 2>&1; }
+
+      : "${REMOTE_DIR:?}"
+      : "${RELEASE_REPO_URL:?}"
+      : "${GROUP_ID:?}"
+      : "${ARTIFACT_ID:?}"
+      : "${COMMIT_TAG:?}"
+      : "${WAS_URL:?}"
+      : "${NEXUS_USER:?}"
+      : "${NEXUS_PASS:?}"
+      : "${CONTEXT_PATH:?}"
+      : "${WEBAPPS_ROOT:?}"
+      : "${USE_RSYNC:?}"
+      : "${HOT_RELOAD:?}"
+      : "${DEPLOY_LOG_NAME:?}"
+      : "${BACKUP_ROOT:?}"
+      : "${HEALTH_MODE:?}"
+      : "${HEALTH_URL_OVERRIDE:-}"
+      : "${HC_TIMEOUT:?}"
+      : "${HC_INTERVAL:?}"
+
+      APP_NAME="${CONTEXT_PATH#/}"
+      LIVE_DIR="${WEBAPPS_ROOT%/}/${APP_NAME}"
+
+      ART_DIR="$REMOTE_DIR/artifacts"
+      NEW_DIR="$REMOTE_DIR/unzip-new"
+      LOG="$ART_DIR/$DEPLOY_LOG_NAME"
+      LIST="$ART_DIR/changed-files.txt"
+      OUT_ZIP="$ART_DIR/diff-deploy-artifacts.zip"
+
+      mkdir -p "$REMOTE_DIR" "$ART_DIR" "$NEW_DIR"
+      : > "$LOG"
+
+      # 도구 확보
+      for t in curl unzip rsync zip diff; do
+        if ! need "$t"; then
+          if   need apk; then sudo apk add --no-cache "$t" || true
+          elif need apt-get; then sudo apt-get update -y && sudo apt-get install -y "$t" || true
+          elif need dnf; then sudo dnf install -y "$t" || true
+          fi
+        fi
+      done
+      need curl || fail "curl not available"
+      need unzip || fail "unzip not available"
+
+      # 새 버전 다운로드 & unzip
+      NEW_VERSION="${COMMIT_TAG#v}"
+      BASE="${RELEASE_REPO_URL%/}/${GROUP_ID//.//}/${ARTIFACT_ID}"
+      NEW_WAR="${ARTIFACT_ID}-${NEW_VERSION}.war"
+      NEW_URL="${BASE}/${NEW_VERSION}/${NEW_WAR}"
+
+      log "Download NEW WAR: $NEW_URL"
+      curl -fsS -u "$NEXUS_USER:$NEXUS_PASS" -o "$REMOTE_DIR/$NEW_WAR" "$NEW_URL" >>"$LOG" 2>&1 || fail "download failed"
+      unzip -q -o "$REMOTE_DIR/$NEW_WAR" -d "$NEW_DIR"
+      [ -d "$NEW_DIR/WEB-INF" ] || fail "invalid WAR structure (no WEB-INF)"
+
+      # 비교 기준: LIVE_DIR (기존 배포 상태)
+      if [ ! -d "$LIVE_DIR" ]; then
+        echo "[WARN] LIVE_DIR not found, first deploy. Copy NEW entirely." | tee -a "$LOG"
+        mkdir -p "$LIVE_DIR"
+        (cd "$NEW_DIR" && tar czf - .) | (cd "$LIVE_DIR" && tar xzf -)
+        ok "Initial deploy completed"
+        # 최초 배포에서도 헬스체크 수행할 수 있음
+        # (기본 actuator, 필요시 HEALTH_* 변수로 제어)
+        build_hc_url() {
+          if [ -n "$HEALTH_URL_OVERRIDE" ]; then printf "%s\n" "$HEALTH_URL_OVERRIDE"; return; fi
+          case "$HEALTH_MODE" in
+            actuator) printf "http://127.0.0.1:8080/%s/actuator/health\n" "$APP_NAME" ;;
+            page)     printf "http://127.0.0.1:8080/%s/\n" "$APP_NAME" ;;
+            none|*)   printf "\n" ;;
+          esac
+        }
+        health_wait() {
+          url="$1" timeout="$2" interval="$3"
+          [ -n "$url" ] || return 0
+          elapsed=0
+          while [ "$elapsed" -lt "$timeout" ]; do
+            if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
+              log "Health OK: $url"; return 0
+            fi
+            sleep "$interval"; elapsed=$((elapsed+interval))
+          done
+          return 1
+        }
+        hc_url="$(build_hc_url)"
+        if [ -n "$hc_url" ]; then
+          log "Health wait (initial): $hc_url (timeout=${HC_TIMEOUT}s)"
+          health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL" || echo "[WARN] Initial health failed" | tee -a "$LOG"
+        fi
+        exit 0
+      fi
+
+      # 변경 목록 산출
+      : > "$LIST"
+      if [ "$USE_RSYNC" = "true" ] && need rsync; then
+        log "Dry-run rsync: $LIVE_DIR vs $NEW_DIR"
+        rsync -avnc --delete --out-format="%n" "$LIVE_DIR/" "$NEW_DIR/" | tee "$LIST" -a "$LOG" >/dev/null
+      else
+        log "Fallback diff -qr"
+        diff -qr "$LIVE_DIR" "$NEW_DIR" | awk '/Only in .*: /{gsub(/^Only in /,"");gsub(": ", "/");print $0} /Files .* differ/{gsub(/^Files /,"");gsub(/ and .* differ$/, "");print $1}' | sed "s#^$LIVE_DIR/##" | tee "$LIST" -a "$LOG" >/dev/null
+      fi
+
+      if [ ! -s "$LIST" ]; then
+        log "No change detected"
+        {
+          echo "CHANGED=0"
+        } > "$ART_DIR/.env"
+        zip -r "$OUT_ZIP" "$LOG" "$ART_DIR/.env" >/dev/null 2>&1 || true
+        ok "No-op diff deploy completed"
+        exit 0
+      fi
+
+      echo "CHANGED=1" > "$ART_DIR/.env"
+
+      # 백업 (LIVE 전체 스냅샷) — 실패 시 자동 롤백에 사용
+      ts="$(date +%Y%m%d%H%M%S)"
+      APP_BACKUP_DIR="${BACKUP_ROOT%/}/${APP_NAME}"
+      mkdir -p "$APP_BACKUP_DIR"
+      BACKUP_FILE="$APP_BACKUP_DIR/diff-backup-${APP_NAME}-${NEW_VERSION}-${ts}.tar.gz"
+      log "Create LIVE backup: $BACKUP_FILE"
+      (cd "$LIVE_DIR" && tar czf "$BACKUP_FILE" .)
+      ln -sfn "$BACKUP_FILE" "$APP_BACKUP_DIR/diff-backup-latest.tar.gz" 2>/dev/null || true
+
+      # 변경 반영
+      log "Applying changed files..."
+      if [ "$USE_RSYNC" = "true" ]; then
+        rsync -av --delete --files-from="$LIST" "$NEW_DIR/" "$LIVE_DIR/" >>"$LOG" 2>&1
+      else
+        while IFS= read -r f; do
+          [ -z "$f" ] && continue
+          d="$(dirname "$f")"
+          mkdir -p "$LIVE_DIR/$d"
+          if [ -d "$NEW_DIR/$f" ]; then
+            mkdir -p "$LIVE_DIR/$f"
+          else
+            cp -fp "$NEW_DIR/$f" "$LIVE_DIR/$f"
+          fi
+        done < "$LIST"
+      fi
+
+      # 서비스 반영
+      if [ "$HOT_RELOAD" = "true" ]; then
+        curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=$CONTEXT_PATH" >>"$LOG" 2>&1 || true
+      else
+        if need systemctl; then
+          sudo systemctl restart tomcat || sudo systemctl restart tomcat10 || true
+        fi
+      fi
+
+      # ── 헬스체크 + 실패 시 자동 롤백 ─────────────────────
+      build_hc_url() {
+        if [ -n "$HEALTH_URL_OVERRIDE" ]; then printf "%s\n" "$HEALTH_URL_OVERRIDE"; return; fi
+        case "$HEALTH_MODE" in
+          actuator) printf "http://127.0.0.1:8080/%s/actuator/health\n" "$APP_NAME" ;;
+          page)     printf "http://127.0.0.1:8080/%s/\n" "$APP_NAME" ;;
+          none|*)   printf "\n" ;;
+        esac
+      }
+      health_wait() {
+        url="$1" timeout="$2" interval="$3"
+        [ -n "$url" ] || return 0
+        elapsed=0
+        while [ "$elapsed" -lt "$timeout" ]; do
+          if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
+            log "Health OK: $url"; return 0
+          fi
+          sleep "$interval"; elapsed=$((elapsed+interval))
+        done
+        return 1
+      }
+
+      hc_url="$(build_hc_url)"
+      if [ -n "$hc_url" ]; then
+        log "Health wait: $hc_url (timeout=${HC_TIMEOUT}s)"
+        if ! health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL"; then
+          echo "[WARN] Health failed ⇒ revert to backup" | tee -a "$LOG"
+          # 자동 롤백 (백업에서 복원)
+          if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl stop tomcat || sudo systemctl stop tomcat10 || true
+          fi
+          rm -rf "$LIVE_DIR"/* "$LIVE_DIR"/.[!.]* "$LIVE_DIR"/..?* 2>/dev/null || true
+          tar xzf "$BACKUP_FILE" -C "$LIVE_DIR"
+          if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl start tomcat || sudo systemctl start tomcat10 || true
+          fi
+          # 복원 후 한 번 더 확인(실패해도 강제 성공으로 두지 않음)
+          health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL" || true
+          {
+            echo "ROLLED_BACK_FROM=$NEW_VERSION"
+            echo "RESTORED_BACKUP=$BACKUP_FILE"
+          } >> "$ART_DIR/.env"
+          # 실패로 종료하여 파이프라인에 알림
+          fail "Deploy health failed. Restored from backup: $BACKUP_FILE"
+        fi
+      else
+        log "Health check skipped"
+      fi
+
+      zip -r "$OUT_ZIP" "$LOG" "$LIST" "$ART_DIR/.env" >/dev/null 2>&1 || true
+      ok "Diff deploy completed (LIVE-based)"
+    REMOTE_SH
+
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "RELEASE_REPO_URL='$(shq "$RELEASE_REPO_URL")'" \
+        "GROUP_ID='$(shq "$GROUP_ID")'" \
+        "ARTIFACT_ID='$(shq "$ARTIFACT_ID")'" \
+        "COMMIT_TAG='$(shq "$COMMIT_TAG")'" \
+        "WAS_URL='$(shq "$WAS_URL")'" \
+        "NEXUS_USER='$(shq "$NEXUS_USER")'" \
+        "NEXUS_PASS='$(shq "$NEXUS_PASS")'" \
+        "CONTEXT_PATH='$(shq "$CONTEXT_PATH")'" \
+        "WEBAPAPS_ROOT='$(shq "$webapps_root")'" \
+        "WEBAPPS_ROOT='$(shq "$webapps_root")'" \
+        "USE_RSYNC='$(shq "$use_rsync")'" \
+        "HOT_RELOAD='$(shq "$hot_reload")'" \
+        "DEPLOY_LOG_NAME='$(shq "$deploy_log_name")'" \
+        "BACKUP_ROOT='$(shq "$backup_root")'" \
+        "HEALTH_MODE='$(shq "$health_mode")'" \
+        "HEALTH_URL_OVERRIDE='$(shq "$health_url_override")'" \
+        "HC_TIMEOUT='$(shq "$hc_timeout")'" \
+        "HC_INTERVAL='$(shq "$hc_interval")'" \
+        'export REMOTE_DIR RELEASE_REPO_URL GROUP_ID ARTIFACT_ID COMMIT_TAG WAS_URL NEXUS_USER NEXUS_PASS CONTEXT_PATH WEBAPPS_ROOT USE_RSYNC HOT_RELOAD DEPLOY_LOG_NAME BACKUP_ROOT HEALTH_MODE HEALTH_URL_OVERRIDE HC_TIMEOUT HC_INTERVAL; sh -s' \
+        < "$remote_script"
+
+      ok "LIVE-based diff deploy finished"
+    }
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 함수: fn_tomcat_diff_restore
+#
+# 목적:
+#   - LIVE 기준 diff 배포 방식에서 생성된 백업(tar.gz)으로 Tomcat 운영 서버를 복구한다.
+#   - 기본적으로 “최신 백업”으로 복원하지만, RESTORE_BACKUP_FILE 변수로 특정 백업을 지정할 수 있다.
+#   - 복원 후 (선택) 헬스체크를 수행하며, 실패 시 더 이전 백업으로 자동 재시도(옵션)할 수 있다.
+#
+# 특징:
+#   - Nexus 미의존: 복구는 원격 서버의 백업 파일만 사용한다.
+#   - 안전한 순서: Tomcat stop → LIVE_DIR 초기화 → tar.gz 복원 → Tomcat start
+#   - 헬스체크(선택): actuator/page/none 및 HEALTH_URL_OVERRIDE 지원
+#   - 자동 재시도(선택): 최신 백업 복원 후 헬스 실패 시, 그보다 이전 백업으로 1회 재시도
+#   - 산출물 압축(zip): 복구 로그/메타(.env)를 artifacts 로 회수할 수 있도록 경로 출력
+#
+# 전제조건:
+#   - diff 배포 시점에 /var/backups/tomcat/<APP>/diff-backup-*.tar.gz 가 정상 생성되어 있어야 한다.
+#   - 원격 서버에서 systemctl 로 tomcat(또는 tomcat10) 관리가 가능해야 한다(없어도 큰 문제는 없지만 stop/start 단계가 생략됨).
+#
+# 폴더구조:
+#  
+#  /opt/tomcat/
+#  ├── releases/  ← 버전별 WAR가 풀리는 디렉터리
+#  │   ├── devops-1.2.0/
+#  │   ├── devops-1.2.0/
+#  │   ├── devops-1.3.0/
+#  │   └── devops-legacy-20251017174229  ← 기존 배포된 lagacy 파일들이 있는 경우 복사되어 옮겨짐 
+#  └── webapps/
+#      └── devops -> /opt/tomcat/releases/devops/devops-1.4.0  ← 현재 운영 버전 심볼릭 링크
+#  
+# 주요동작:
+#
+# GitLab Runner
+#   │
+#   ├─ SSH 접속
+#   │
+#   ▼
+# Tomcat Server (/opt/tomcat/webapps/<APP>)
+#   │
+#   ├─ (1) 복원 대상 백업 선택
+#   │       - RESTORE_BACKUP_FILE 지정 시: 해당 tar.gz
+#   │       - 미지정 시: /var/backups/tomcat/<APP>/ 의 최신 파일
+#   │
+#   ├─ (2) Tomcat stop
+#   │
+#   ├─ (3) LIVE 초기화
+#   │       rm -rf /opt/tomcat/webapps/<APP>/*
+#   │
+#   ├─ (4) 백업 복원
+#   │       tar xzf <backup.tar.gz> -C /opt/tomcat/webapps/<APP>/
+#   │
+#   ├─ (5) Tomcat start
+#   │
+#   ├─ (6) (선택) 헬스체크
+#   │       - HEALTH_URL_OVERRIDE 있으면 그 URL
+#   │       - 없으면 모드에 따라:
+#   │           actuator: http://127.0.0.1:8080/<APP>/actuator/health
+#   │           page:     http://127.0.0.1:8080/<APP>/
+#   │           none:     스킵
+#   │
+#   ├─ (7) (옵션) 헬스 실패 시 이전 백업으로 재시도
+#   │       - 가장 최근에 사용한 백업보다 더 오래된 파일 선택
+#   │       - stop → 초기화 → 복원 → start → 재확인
+#   │
+#   └─ (8) 결과 zip 회수
+#           /tmp/gitlab-build-.../artifacts/diff-rollback-artifacts.zip
+#           (로그, .env: TARGET_BACKUP / ROLLED_BACK_TO 등)
+#
+# 생성/수정 리소스:
+#   - 원격: <WEBAPPS_ROOT>/<APP_NAME> (LIVE exploded dir; 내용 교체)
+#   - 원격: <REMOTE_DIR>/artifacts/diff-rollback-artifacts.zip
+#   - 로컬(Runner): (히든잡/파이프라인에서 scp 회수 시 저장)
+#
+# 변수(필수/선택):
+#   [필수]
+#     REMOTE_DEPLOY_HOST, REMOTE_DEPLOY_USER, REMOTE_DIR, CONTEXT_PATH
+#   [선택/기본값]
+#     REMOTE_DEPLOY_PORT=22
+#     TOMCAT_WEBAPPS_DIR=/opt/tomcat/webapps
+#     DIFF_BACKUP_DIR=/var/backups/tomcat
+#     DIFF_BACKUP_PREFIX=diff-backup
+#     RESTORE_BACKUP_FILE=""              # 비우면 최신 자동 선택
+#     RESTORE_LOG_NAME=diff-rollback.log
+#     HEALTH_MODE=actuator|page|none      # 기본 actuator
+#     HEALTH_URL_OVERRIDE=""              # 지정 시 최우선
+#     HEALTHCHECK_TIMEOUT=60
+#     HEALTHCHECK_INTERVAL=2
+#     RESTORE_FALLBACK_PREV=true          # 헬스 실패 시 더 이전 백업 자동 재시도
+#
+# 예시:
+#   - 최신 백업으로 복원:
+#       script:
+#         - !reference [.fn_tomcat_diff_restore, script]
+#         - fn_tomcat_diff_restore
+#   - 특정 백업으로 복원:
+#       variables:
+#         RESTORE_BACKUP_FILE: "/var/backups/tomcat/devops/diff-backup-devops-1.4.2-20251018112233.tar.gz"
+# ───────────────────────────────────────────────────────────────────────────────
+.fn_tomcat_diff_restore:
+  script: |
+    fn_tomcat_diff_restore() {
+      set -eu
+
+      # ── 필수 ─────────────────────────────────────────────
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+
+      # ── 옵션/기본값 ─────────────────────────────────────
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      webapps_root="${TOMCAT_WEBAPPS_DIR:-/opt/tomcat/webapps}"
+      backup_root="${DIFF_BACKUP_DIR:-/var/backups/tomcat}"
+      backup_prefix="${DIFF_BACKUP_PREFIX:-diff-backup}"
+      restore_backup_file="${RESTORE_BACKUP_FILE:-}"
+      restore_log_name="${RESTORE_LOG_NAME:-diff-rollback.log}"
+
+      # 헬스체크(선택)
+      health_mode="${HEALTH_MODE:-actuator}"               # actuator|page|none
+      health_url_override="${HEALTH_URL_OVERRIDE:-}"
+      hc_timeout="${HEALTHCHECK_TIMEOUT:-60}"
+      hc_interval="${HEALTHCHECK_INTERVAL:-2}"
+      restore_fallback_prev="${RESTORE_FALLBACK_PREV:-true}"
+
+      # ── 유틸 ───────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      # ── 원격 스크립트 ──────────────────────────────────
+      remote_script=$(mktemp /tmp/remote_diff_restore_live.XXXXXX)
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -eu
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      need() { command -v "$1" >/dev/null 2>&1; }
+
+      : "${REMOTE_DIR:?}"
+      : "${CONTEXT_PATH:?}"
+      : "${WEBAPPS_ROOT:?}"
+      : "${BACKUP_ROOT:?}"
+      : "${BACKUP_PREFIX:?}"
+      : "${RESTORE_BACKUP_FILE:-}"
+      : "${RESTORE_LOG_NAME:?}"
+      : "${HEALTH_MODE:?}"
+      : "${HEALTH_URL_OVERRIDE:-}"
+      : "${HC_TIMEOUT:?}"
+      : "${HC_INTERVAL:?}"
+      : "${RESTORE_FALLBACK_PREV:?}"
+
+      APP_NAME="${CONTEXT_PATH#/}"
+      LIVE_DIR="${WEBAPPS_ROOT%/}/${APP_NAME}"
+      APP_BACKUP_DIR="${BACKUP_ROOT%/}/${APP_NAME}"
+      ART_DIR="$REMOTE_DIR/artifacts"
+      LOG="$ART_DIR/$RESTORE_LOG_NAME"
+      OUT_ZIP="$ART_DIR/diff-rollback-artifacts.zip"
+
+      mkdir -p "$ART_DIR" "$APP_BACKUP_DIR"
+      : > "$LOG"
+
+      # 도구 보장
+      for t in tar curl zip; do
+        if ! need "$t"; then
+          if   need apk; then sudo apk add --no-cache "$t" || true
+          elif need apt-get; then sudo apt-get update -y && sudo apt-get install -y "$t" || true
+          elif need dnf; then sudo dnf install -y "$t" || true
+          fi
+        fi
+      done
+      need tar || fail "tar not available"
+
+      list_backups() {
+        ls -1t "$APP_BACKUP_DIR"/${BACKUP_PREFIX}-${APP_NAME}-*.tar.gz 2>/dev/null || true
+      }
+
+      choose_target_backup() {
+        if [ -n "${RESTORE_BACKUP_FILE:-}" ]; then
+          printf "%s\n" "$RESTORE_BACKUP_FILE"
+        else
+          list_backups | head -n1
+        fi
+      }
+
+      # 헬스 URL 구성
+      build_hc_url() {
+        if [ -n "$HEALTH_URL_OVERRIDE" ]; then
+          printf "%s\n" "$HEALTH_URL_OVERRIDE"; return 0
+        fi
+        case "$HEALTH_MODE" in
+          actuator) printf "http://127.0.0.1:8080/%s/actuator/health\n" "$APP_NAME" ;;
+          page)     printf "http://127.0.0.1:8080/%s/\n" "$APP_NAME" ;;
+          none|*)   printf "\n" ;;
+        esac
+      }
+
+      # 헬스 대기
+      health_wait() {
+        url="$1" timeout="$2" interval="$3"
+        [ -n "$url" ] || return 0
+        elapsed=0
+        while [ "$elapsed" -lt "$timeout" ]; do
+          if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
+            log "Health OK: $url"; return 0
+          fi
+          sleep "$interval"; elapsed=$((elapsed+interval))
+        done
+        return 1
+      }
+
+      stop_tomcat() {
+        if command -v systemctl >/dev/null 2>&1; then
+          systemctl stop tomcat || systemctl stop tomcat10 || true
+        fi
+      }
+      start_tomcat() {
+        if command -v systemctl >/dev/null 2>&1; then
+          systemctl start tomcat || systemctl start tomcat10 || true
+        fi
+      }
+
+      restore_from_backup() {
+        bfile="$1"
+        [ -n "$bfile" ] && [ -f "$bfile" ] || fail "backup not found: ${bfile:-<empty>}"
+        log "▶ Restore from: $bfile"
+        stop_tomcat
+        mkdir -p "$LIVE_DIR"
+        rm -rf "$LIVE_DIR"/* "$LIVE_DIR"/.[!.]* "$LIVE_DIR"/..?* 2>/dev/null || true
+        tar xzf "$bfile" -C "$LIVE_DIR"
+        start_tomcat
+      }
+
+      # 메인 플로우
+      target="$(choose_target_backup)"; [ -n "$target" ] || fail "no backup to restore"
+      echo "TARGET_BACKUP=$target" | tee -a "$LOG"
+      restore_from_backup "$target"
+
+      hc_url="$(build_hc_url)"
+      if [ -n "$hc_url" ]; then
+        log "Health wait: $hc_url (timeout=${HC_TIMEOUT}s)"
+        if ! health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL"; then
+          echo "[WARN] Health failed after restore: $target" | tee -a "$LOG"
+          if [ "$RESTORE_FALLBACK_PREV" = "true" ]; then
+            prev="$(list_backups | grep -v -F "$target" | head -n1 || true)"
+            if [ -n "$prev" ]; then
+              echo "[INFO] Try previous backup: $prev" | tee -a "$LOG"
+              restore_from_backup "$prev"
+              health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL" || true
+              echo "ROLLED_BACK_TO=$prev" >> "$ART_DIR/.env"
+            else
+              fail "no older backup to fallback"
+            fi
+          else
+            fail "restore health failed"
+          fi
+        fi
+      else
+        log "Health check skipped"
+      fi
+
+      {
+        echo "LIVE_DIR=$LIVE_DIR"
+        echo "TARGET_BACKUP=$target"
+      } >> "$ART_DIR/.env"
+
+      rm -f "$OUT_ZIP"
+      zip -r "$OUT_ZIP" "$LOG" "$ART_DIR/.env" >/dev/null 2>&1 || true
+      ok "Diff rollback completed"
+      echo "$OUT_ZIP"
+    REMOTE_SH
+
+      # ── 원격 SSH 실행 ─────────────────────────────────────
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "CONTEXT_PATH='$(shq "$CONTEXT_PATH")'" \
+        "WEBAPPS_ROOT='$(shq "$webapps_root")'" \
+        "BACKUP_ROOT='$(shq "$backup_root")'" \
+        "BACKUP_PREFIX='$(shq "$backup_prefix")'" \
+        "RESTORE_BACKUP_FILE='$(shq "$restore_backup_file")'" \
+        "RESTORE_LOG_NAME='$(shq "$restore_log_name")'" \
+        "HEALTH_MODE='$(shq "$health_mode")'" \
+        "HEALTH_URL_OVERRIDE='$(shq "$health_url_override")'" \
+        "HC_TIMEOUT='$(shq "$hc_timeout")'" \
+        "HC_INTERVAL='$(shq "$hc_interval")'" \
+        "RESTORE_FALLBACK_PREV='$(shq "$restore_fallback_prev")'" \
+        'export REMOTE_DIR CONTEXT_PATH WEBAPPS_ROOT BACKUP_ROOT BACKUP_PREFIX RESTORE_BACKUP_FILE RESTORE_LOG_NAME HEALTH_MODE HEALTH_URL_OVERRIDE HC_TIMEOUT HC_INTERVAL RESTORE_FALLBACK_PREV; sh -s' \
+        < "$remote_script"
+
+      rm -f "$remote_script" || true
+    }
+
+# ────────────────────────────────────────────────
+# 함수: fn_tomcat_symbolic_deploy
+#
+# 목적:
+#   - Tomcat 운영 서버에 "심링크 전환 방식"으로 새 버전을 배포한다.
+#   - LIVE 링크(webapps/<APP_NAME>)를 /opt/tomcat/releases/<APP_NAME>/<APP_NAME>-<version> 로 전환.
+#   - 헬스체크 실패 시, 직전 타깃 디렉터리로 자동 롤백한다.
+#
+# 동작 개요:
+#   1) Runner → SSH 접속 → 원격 임시 스크립트 생성
+#   2) Nexus에서 NEW WAR 다운로드 및 검사/압축해제
+#   3) releases/<APP>/<APP-<version>> 디렉터리 생성 후 WAR unzip 결과 반영
+#   4) LIVE 링크를 심링크로 보정(최초 1회, 디렉터리→심링크 마이그레이션)
+#   5) LIVE 링크를 새 버전 디렉터리로 원자적 전환 (ln -sfn)
+#   6) Tomcat reload 시도(불가 시 restart)
+#   7) 헬스체크(HEALTH_MODE 또는 --health-url 대체); 실패 시 자동 롤백
+#   8) 보관정책(KEEP_RELEASES) 적용: 오래된 릴리스 디렉터리 삭제
+#   9) 로그/메타(.env)를 zip으로 묶어 Runner 아티팩트로 회수
+#
+# 특징:
+#   - 원격 SSH 실행/정리/아티팩트 회수 플로우는 기존과 동일
+#   - LIVE가 디렉터리인 레거시 환경을 자동으로 심링크로 전환
+#   - Nexus 인증 기반 다운로드(유저/패스), 필요한 툴은 OS별 설치 시도
+#   - HOT_RELOAD=true & Tomcat Manager 계정이 있으면 컨텍스트 reload 시도
+#   - 실패 시 직전 타깃(심링크의 이전 대상)으로 즉시 되돌림
+#
+# 생성/수정되는 리소스:
+#   - 원격: /opt/tomcat/releases/<APP_NAME>/<APP_NAME>-<version> (새 버전)
+#   - 원격: <WEBAPPS_ROOT>/<APP_NAME> (LIVE 심링크)
+#   - 원격: <REMOTE_DIR>/artifacts/{symlink-deploy-artifacts.zip, .env, 로그}
+#   - 로컬(Runner): artifacts/symlink-deploy-artifacts.zip (회수)
+#
+# 종료/실패 시나리오:
+#   - 헬스체크 실패 시: 라이브 링크를 직전 타깃으로 되돌리고 종료(비정상 종료)
+#   - 이전 타깃 부재 시: 롤백 불가로 실패 처리
+#
+# 권장 전제조건:
+#   - Tomcat 서비스명이 정확(TOMCAT_SERVICE), manager(reload) 권한은 선택
+#   - releases, webapps 경로에 쓰기 가능(권한/SELinux 정책 환경에 맞춰 운영)
+#   - Nexus에 해당 버전 WAR가 존재하고 접근 가능
+# ────────────────────────────────────────────────
+.fn_tomcat_symbolic_deploy:
+  script: |
+    fn_tomcat_symbolic_deploy() {
+      set -eu
+
+      # ── 필수 입력 ─────────────────────────────────────
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${WAS_URL:?WAS_URL is required}"
+      : "${NEXUS_USER:?NEXUS_USER is required}"
+      : "${NEXUS_PASS:?NEXUS_PASS is required}"
+      : "${CONTEXT_PATH:?CONTEXT_PATH is required}"   # 예: /devops
+
+      # ── 선택 입력(기본값) ───────────────────────────
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      webapps_root="${TOMCAT_WEBAPPS_DIR:-/opt/tomcat/webapps}"
+      releases_base="${RELEASES_BASE:-/opt/tomcat/releases}"
+      tomcat_service="${TOMCAT_SERVICE:-tomcat}"         # tomcat|tomcat9|tomcat10 등
+      keep_releases="${KEEP_RELEASES:-5}"
+
+      # 헬스체크 정책
+      health_mode="${HEALTH_MODE:-actuator}"             # actuator|page|none
+      health_url_override="${HEALTH_URL_OVERRIDE:-}"     # 지정 시 최우선
+      hc_timeout="${HEALTHCHECK_TIMEOUT:-60}"
+      hc_interval="${HEALTHCHECK_INTERVAL:-2}"
+
+      # Tomcat manager 옵션(핫리로드)
+      hot_reload="${HOT_RELOAD:-false}"
+      deploy_user="${DEPLOY_USER:-}"
+      deploy_pass="${DEPLOY_PASS:-}"
+
+      # 로그/산출물
+      deploy_log_name="${DEPLOY_LOG_NAME:-symlink-deploy.log}"
+
+      # ── 유틸 ─────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      # ── 원격 스크립트 생성 ───────────────────────────
+      remote_script=$(mktemp /tmp/remote_symlink_deploy.XXXXXX)
+      log "Created temporary symlink deploy script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -eu
+
+      # BAD marker defaults
+      BAD_MARKER_NAME="${BAD_MARKER_NAME:-.bad}"
+      MARK_BAD_ON_ROLLBACK="${MARK_BAD_ON_ROLLBACK:-true}"
+
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      need() { command -v "$1" >/dev/null 2>&1; }
+      timestamp() { date +%Y%m%d%H%M%S; }
+      is_link() { sudo test -L "$1"; }   # 심볼릭 링크인가?
+      is_dir()  { sudo test -d "$1"; }   # 디렉터리인가?
+      is_any()  { sudo test -e "$1" -o -L "$1"; }  # 어떤 엔트리든 존재하나? (링크 포함)
+
+      # ── 필수 env ─────────────────────────────────────
+      : "${REMOTE_DIR:?}"
+      : "${RELEASE_REPO_URL:?}"
+      : "${GROUP_ID:?}"
+      : "${ARTIFACT_ID:?}"
+      : "${COMMIT_TAG:?}"
+      : "${WAS_URL:?}"
+      : "${NEXUS_USER:?}"
+      : "${NEXUS_PASS:?}"
+      : "${CONTEXT_PATH:?}"
+      : "${WEBAPPS_ROOT:?}"
+      : "${RELEASES_BASE:?}"
+      : "${TOMCAT_SERVICE:?}"
+      : "${KEEP_RELEASES:?}"
+
+      : "${HEALTH_MODE:?}"
+      : "${HC_TIMEOUT:?}"
+      : "${HC_INTERVAL:?}"
+      : "${HEALTH_URL_OVERRIDE:-}"
+
+      : "${HOT_RELOAD:?}"
+      : "${DEPLOY_USER:-}"
+      : "${DEPLOY_PASS:-}"
+
+      : "${DEPLOY_LOG_NAME:?}"
+
+      APP_NAME="$(printf "%s" "${CONTEXT_PATH#/}")"     # "/devops" → "devops"
+      LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
+      LIVE_LINK="${LIVE_LINK%/}"
+      APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
+
+      ART_DIR="$REMOTE_DIR/artifacts"
+      LOG="$ART_DIR/$DEPLOY_LOG_NAME"
+      OUT_ZIP="$ART_DIR/symlink-deploy-artifacts.zip"
+      sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
+      : > "$LOG"
+
+      # 도구 보장
+      for t in curl unzip zip ln readlink; do
+        if ! need "$t"; then
+          if   need apk; then sudo apk add --no-cache "$t" || true
+          elif need apt-get; then sudo apt-get update -y && sudo apt-get install -y "$t" || true
+          elif need dnf; then sudo dnf install -y "$t" || true
+          fi
+        fi
+      done
+      need curl || fail "curl not available"
+      need unzip || fail "unzip not available"
+      need zip  || fail "zip not available"
+      need ln   || fail "ln not available"
+      need readlink || fail "readlink not available"
+
+      # 버전/URL
+      NEW_VERSION="${COMMIT_TAG#v}"
+      BASE="${RELEASE_REPO_URL%/}/${GROUP_ID//.//}/${ARTIFACT_ID}"
+      NEW_WAR="${ARTIFACT_ID}-${NEW_VERSION}.war"
+      NEW_URL="${BASE}/${NEW_VERSION}/${NEW_WAR}"
+
+      # 새 버전 작업 디렉터리
+      tmp_dir="${APP_RELEASES_DIR}/${APP_NAME}-${NEW_VERSION}.tmp.$$"
+      new_dir="${APP_RELEASES_DIR}/${APP_NAME}-${NEW_VERSION}"
+
+      # 현재 타깃(이전)
+      prev_target=""
+      if [ -L "$LIVE_LINK" ]; then
+        prev_target="$(sudo readlink -f "$LIVE_LINK" || true)"
+      fi
+      echo "NEW_VERSION=$NEW_VERSION" | tee -a "$LOG"
+      [ -n "$prev_target" ] && echo "PREV_TARGET=$prev_target" | tee -a "$LOG" || true
+
+      # 헬스 대기 함수
+      health_wait() {
+        url="$1" timeout="$2" interval="$3"
+        elapsed=0
+        while [ "$elapsed" -lt "$timeout" ]; do
+          if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
+            log "Health OK: $url"
+            return 0
+          fi
+          sleep "$interval"
+          elapsed=$((elapsed+interval))
+        done
+        return 1
+      }
+
+      # Tomcat reload/restart
+      tomcat_reload_or_restart() {
+        if command -v systemctl >/dev/null 2>&1; then
+          if sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null; then
+            log "Tomcat reload ok"
+            return 0
+          fi
+          log "Reload unsupported → restart"
+          sudo systemctl restart "$TOMCAT_SERVICE"
+          log "Tomcat restart ok"
+        fi
+      }
+
+      ln_s_safe() {
+        local tgt="$1" link="$2"
+        link="${link%/}"
+        sudo ln -sT "$tgt" "$link" 2>/dev/null || sudo ln -s "$tgt" "$link"
+      }
+
+      migrate_live_once() {
+        local releases_base_dir="$1"
+        sudo mkdir -p "$releases_base_dir"
+
+        # 진단 로그(권한 이슈 회피 위해 sudo 사용)
+        log "MIGRATE: WEBAPPS_ROOT=$WEBAPPS_ROOT APP_NAME=$APP_NAME"
+        log "MIGRATE: LIVE_LINK=$LIVE_LINK"
+        log "MIGRATE: probe: $(sudo ls -ld "$LIVE_LINK" 2>/dev/null || echo '<not-found-or-no-perm>')"
+
+        if is_link "$LIVE_LINK"; then
+          log "MIGRATE: skip (already symlink) -> $(sudo readlink -f "$LIVE_LINK" 2>/dev/null || echo '<broken>')"
+          return 0
+        fi
+
+        if is_dir "$LIVE_LINK"; then
+          local legacy="${releases_base_dir}/${APP_NAME}-legacy-$(timestamp)"
+          log "MIGRATE: moving existing DIR to legacy: $legacy"
+          sudo mv "$LIVE_LINK" "$legacy"
+          prev_target="$legacy"
+          log "MIGRATE: moved dir -> $(sudo ls -ld "$legacy")"
+        elif is_any "$LIVE_LINK"; then
+          local legacy="${releases_base_dir}/${APP_NAME}-legacy-$(timestamp).file"
+          log "MIGRATE: moving existing FILE to legacy: $legacy"
+          sudo mv "$LIVE_LINK" "$legacy"
+          log "MIGRATE: moved file -> $(sudo ls -l "$legacy")"
+        else
+          log "MIGRATE: nothing to move (not found / no perm)"
+        fi
+      }
+
+      set_live_symlink() {
+        local target_version_dir="$1"
+        local tmp_link="${LIVE_LINK}.new.$(timestamp)"
+
+        # tmp 링크 생성
+        ln_s_safe "$target_version_dir" "$tmp_link"
+        # mv -Tf (GNU) → 실패 시 rm && mv 폴백
+        sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || {
+          sudo rm -rf --one-file-system "$LIVE_LINK"
+          sudo mv "$tmp_link" "$LIVE_LINK"
+        }
+        log "LIVE -> $target_version_dir"
+      }
+
+      # 새 버전 준비 (다운로드 → unzip → 소유/권한은 운영 정책에 맞게 별도 처리 가능)
+      sudo mkdir -p "$tmp_dir"
+      log "Download NEW: $NEW_URL"
+      sudo curl -fsS -u "$NEXUS_USER:$NEXUS_PASS" -o "$tmp_dir/$NEW_WAR" "$NEW_URL" >>"$LOG" 2>&1 || fail "download failed"
+      sudo unzip -q "$tmp_dir/$NEW_WAR" -d "$tmp_dir/unzip"
+      [ -d "$tmp_dir/unzip/WEB-INF" ] || fail "WAR structure invalid (no WEB-INF)"
+      sudo mv "$tmp_dir/unzip" "$new_dir"
+      sudo rm -rf "$tmp_dir" || true
+
+      # LIVE 마이그레이션 + 심링크 전환
+      # 1) 최초 1회: LIVE_LINK가 '링크가 아닌' 디렉터리/파일이면 releases 베이스로 legacy 이동만 수행
+      migrate_live_once "$APP_RELEASES_DIR"     # 예: /opt/tomcat/releases/devops
+      # 2) 새 버전 디렉터리를 가리키도록 LIVE 링크 전환 (원자적 교체)
+      set_live_symlink "$new_dir"               # 예: /opt/tomcat/releases/devops/devops-20.0.6
+
+      # 서비스 갱신
+      if [ "$HOT_RELOAD" = "true" ] && [ -n "$DEPLOY_USER" ] && [ -n "$DEPLOY_PASS" ] && command -v curl >/dev/null 2>&1; then
+        curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" >>"$LOG" 2>&1 || true
+      else
+        tomcat_reload_or_restart
+      fi
+
+      # 헬스체크
+      hc_url=""
+      if [ -n "$HEALTH_URL_OVERRIDE" ]; then
+        hc_url="$HEALTH_URL_OVERRIDE"
+      else
+        case "$HEALTH_MODE" in
+          actuator) hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
+          page)     hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
+          none)     hc_url="" ;;
+          *)        hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
+        esac
+      fi
+
+      if [ -n "$hc_url" ]; then
+        log "Health wait: $hc_url (timeout=${HC_TIMEOUT}s, mode=${HEALTH_MODE})"
+        if ! health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL"; then
+          echo "[WARN] Health failed → rollback to previous" | tee -a "$LOG"
+
+          # mark BAD on the failed new_dir before rollback completes
+          if [ "$MARK_BAD_ON_ROLLBACK" = "true" ]; then
+            sudo sh -c "printf 'marked bad on %s\n' \"$(date -Ins)\" > '$new_dir/$BAD_MARKER_NAME'"
+          fi
+
+          if [ -n "$prev_target" ] && [ -d "$prev_target" ]; then
+            set_live_symlink "$prev_target"
+            tomcat_reload_or_restart
+            health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL" || true
+            fail "Deploy failed. Rolled back to: $prev_target"
+          else
+            fail "Deploy failed and no previous target to rollback"
+          fi
+        fi
+      else
+        log "Health check skipped"
+      fi
+
+      # 보관정책: 최신 N개 유지
+      if command -v ls >/dev/null 2>&1; then
+        mapfile -t rels < <(ls -1dt "${APP_RELEASES_DIR}/${APP_NAME}-"* 2>/dev/null || true)
+        if [ "${#rels[@]}" -gt "$KEEP_RELEASES" ]; then
+          for ((i=KEEP_RELEASES; i<${#rels[@]}; i++)); do
+            [ "${rels[$i]}" = "$prev_target" ] && continue
+            log "Keep-policy: remove ${rels[$i]}"
+            sudo rm -rf --one-file-system "${rels[$i]}" || true
+          done
+        fi
+      fi
+
+      # 산출물 구성
+      {
+        echo "CHANGED=1"
+        echo "NEW_DIR=$new_dir"
+        echo "PREV_DIR=${prev_target:-}"
+        echo "LIVE_LINK=$LIVE_LINK"
+      } > "$ART_DIR/.env"
+
+      rm -f "$OUT_ZIP"
+      zip -r "$OUT_ZIP" "$LOG" "$ART_DIR/.env" >/dev/null 2>&1 || true
+      ok "Symlink deploy completed"
+      echo "$OUT_ZIP"
+    REMOTE_SH
+
+      # ── 원격 실행 ─────────────────────────────────────
+      log "▶ Executing symlink deploy via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "RELEASE_REPO_URL='$(shq "$RELEASE_REPO_URL")'" \
+        "GROUP_ID='$(shq "$GROUP_ID")'" \
+        "ARTIFACT_ID='$(shq "$ARTIFACT_ID")'" \
+        "COMMIT_TAG='$(shq "$COMMIT_TAG")'" \
+        "WAS_URL='$(shq "$WAS_URL")'" \
+        "NEXUS_USER='$(shq "$NEXUS_USER")'" \
+        "NEXUS_PASS='$(shq "$NEXUS_PASS")'" \
+        "CONTEXT_PATH='$(shq "$CONTEXT_PATH")'" \
+        "WEBAPPS_ROOT='$(shq "$webapps_root")'" \
+        "RELEASES_BASE='$(shq "$releases_base")'" \
+        "TOMCAT_SERVICE='$(shq "$tomcat_service")'" \
+        "KEEP_RELEASES='$(shq "$keep_releases")'" \
+        "HEALTH_MODE='$(shq "$health_mode")'" \
+        "HEALTH_URL_OVERRIDE='$(shq "$health_url_override")'" \
+        "HC_TIMEOUT='$(shq "$hc_timeout")'" \
+        "HC_INTERVAL='$(shq "$hc_interval")'" \
+        "HOT_RELOAD='$(shq "$hot_reload")'" \
+        "DEPLOY_USER='$(shq "$deploy_user")'" \
+        "DEPLOY_PASS='$(shq "$deploy_pass")'" \
+        "DEPLOY_LOG_NAME='$(shq "$deploy_log_name")'" \
+        "MARK_BAD_ON_ROLLBACK='$(shq "${MARK_BAD_ON_ROLLBACK:-true}")'" \
+        "BAD_MARKER_NAME='$(shq "${BAD_MARKER_NAME:-.bad}")'" \
+        'export REMOTE_DIR RELEASE_REPO_URL GROUP_ID ARTIFACT_ID COMMIT_TAG WAS_URL NEXUS_USER NEXUS_PASS CONTEXT_PATH WEBAPPS_ROOT RELEASES_BASE TOMCAT_SERVICE KEEP_RELEASES HEALTH_MODE HEALTH_URL_OVERRIDE HC_TIMEOUT HC_INTERVAL HOT_RELOAD DEPLOY_USER DEPLOY_PASS DEPLOY_LOG_NAME MARK_BAD_ON_ROLLBACK BAD_MARKER_NAME; bash -s' \
+        < "$remote_script" | tee /tmp/_symlink_deploy_out.txt
+
+      # 산출물 회수
+      remote_zip_path="$(tail -n1 /tmp/_symlink_deploy_out.txt || true)"
+      [ -z "$remote_zip_path" ] && remote_zip_path="${REMOTE_DIR}/artifacts/symlink-deploy-artifacts.zip"
+      local_dir="${CI_PROJECT_DIR:-.}/artifacts"
+      mkdir -p "$local_dir"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip_path" "$local_dir/" || true
+
+      rm -f "$remote_script" /tmp/_symlink_deploy_out.txt || true
+      ok "Symlink deploy finished"
+    }
+
+
+# ────────────────────────────────────────────────
+# 함수: fn_tomcat_symbolic_restore
+#
+# 목적:
+#   - LIVE 심링크를 “이전 릴리스 디렉터리” 또는 지정 버전 디렉터리로 되돌려 롤백한다.
+#   - (선택) 헬스체크 수행. 실패 시 실패로 종료(필요 시 한 단계 더 이전으로 수동 롤백).
+#
+# 동작 개요:
+
+# GitLab Runner
+#    │
+#    ├─ SSH 접속
+#    │
+#    ▼
+# Tomcat Server
+#   (/opt/tomcat/webapps/<APP>, /opt/tomcat/releases/<APP>/)
+#    │
+#    ├─ (1) Nexus에서 NEW WAR 다운로드 (HTTPS, curl -u)
+#    │       BASE = <RELEASE_REPO_URL>/<GROUP_ID>/<ARTIFACT_ID>/
+#    │       NEW  = <ARTIFACT_ID>-<NEW_VERSION>.war
+#    │       TMP  = /opt/tomcat/releases/<APP>/<APP>-<ver>.tmp.$$
+#    │            → unzip →  TMP/unzip/
+#    │            → mv TMP/unzip  ⇒  /opt/tomcat/releases/<APP>/<APP>-<ver> (new_dir)
+#    │            → rm -rf TMP
+#    │
+#    ├─ (2) LIVE 링크 교정(최초 1회만)
+#    │       LIVE_LINK = /opt/tomcat/webapps/<APP>
+#    │       - LIVE가 디렉터리면:
+#    │           • 백업 디렉터리 생성: /opt/tomcat/releases/<APP>/<APP>-legacy-<ts>/
+#    │           • LIVE/* → legacy 로 이동 후 LIVE 제거
+#    │           • ln -s <new_dir>  LIVE_LINK
+#    │       - LIVE가 파일/깨진 링크면 제거 후 신규 심링크 생성
+#    │       - 이미 심링크면 통과
+#    │
+#    ├─ (3) LIVE 전환 (원자적 심링크 스위치)
+#    │       ln -sfn <new_dir>  <LIVE_LINK>
+#    │       (이전 대상은 readlink -f <LIVE_LINK>로 prev_target 확보)
+#    │
+#    ├─ (4) Tomcat 적용
+#    │       - HOT_RELOAD=true & manager 계정 있으면:
+#    │           http://<WAS_URL>/manager/text/reload?path=/<APP>
+#    │       - 아니면: systemctl reload 실패 시 restart
+#    │
+#    ├─ (5) 헬스체크 (선택)
+#    │       - HEALTH_URL_OVERRIDE 지정 시 해당 URL
+#    │       - 아니면 모드별:
+#    │           actuator: http://127.0.0.1:8080/<APP>/actuator/health
+#    │           page:     http://127.0.0.1:8080/<APP>/
+#    │           none:     스킵
+#    │       - 실패 시:
+#    │           ln -sfn <prev_target>  <LIVE_LINK>   # 즉시 롤백
+#    │           Tomcat reload/restart 후 종료(실패)
+#    │
+#    ├─ (6) 보관정책(KEEP_RELEASES)
+#    │       /opt/tomcat/releases/<APP>/<APP>-* 를 최신순 정렬
+#    │       → 최신 N개 남기고 나머지 삭제(이때 prev_target 은 삭제 제외)
+#    │
+#    └─ (7) 결과 산출물(zip)
+#            <REMOTE_DIR>/artifacts/symlink-deploy-artifacts.zip
+#              ├── symlink-deploy.log
+#              └── .env (CHANGED, NEW_DIR, PREV_DIR, LIVE_LINK)
+#
+# 특징:
+#   - diff(증분) 복원 방식이 아닌, “심링크 전환” 기반의 즉시 롤백
+#   - 지정 버전으로의 직접 롤백이나 자동 이전 롤백 둘 다 지원
+#   - Runner 아티팩트로 롤백 로그/메타 제공
+#
+# 생성/수정되는 리소스:
+#   - 원격: LIVE 링크(<WEBAPPS_ROOT>/<APP_NAME>) → /opt/tomcat/releases/<APP>/<APP-<version>>
+#   - 원격: <REMOTE_DIR>/artifacts/symlink-rollback-artifacts.zip
+#   - 로컬(Runner): artifacts/symlink-rollback-artifacts.zip
+#
+# 실패 시나리오:
+#   - 대상 디렉터리 부재(잘못된 버전 지정/보관정책으로 삭제됨) 시 실패
+#   - 헬스체크 실패 시 실패(필요하면 한 단계 더 이전 버전으로 수동 재시도)
+#
+# 권장 전제조건:
+#   - releases 디렉터리에 유효한 이전 버전 디렉터리 존재
+#   - Tomcat 재적용(reload/restart) 권한 보유
+# ────────────────────────────────────────────────
+.fn_tomcat_symbolic_restore:
+  script: |
+    fn_tomcat_symbolic_restore() {
+      set -eu
+
+      # ── 필수 ──────────────────────────────────────────
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+      : "${WAS_URL:?WAS_URL is required}"
+
+      # ── 선택 ──────────────────────────────────────────
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      webapps_root="${TOMCAT_WEBAPPS_DIR:-/opt/tomcat/webapps}"
+      releases_base="${RELEASES_BASE:-/opt/tomcat/releases}"
+      tomcat_service="${TOMCAT_SERVICE:-tomcat}"
+      rollback_to_version="${ROLLBACK_TO_VERSION:-}"   # 지정 시 해당 버전으로 롤백
+
+      # Tomcat manager 옵션(핫리로드)
+      hot_reload="${HOT_RELOAD:-false}"
+      deploy_user="${DEPLOY_USER:-}"
+      deploy_pass="${DEPLOY_PASS:-}"
+
+      # 헬스체크 정책
+      health_mode="${HEALTH_MODE:-actuator}"           # actuator|page|none
+      health_url_override="${HEALTH_URL_OVERRIDE:-}"
+      hc_timeout="${HEALTHCHECK_TIMEOUT:-60}"
+      hc_interval="${HEALTHCHECK_INTERVAL:-2}"
+
+      # 로그/산출물
+      restore_log_name="${RESTORE_LOG_NAME:-symlink-rollback.log}"
+
+      # ── 유틸 ──────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      # ── 원격 스크립트 생성 ───────────────────────────
+      remote_script=$(mktemp /tmp/remote_symlink_rollback.XXXXXX)
+      log "Created temporary symlink rollback script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -eu
+
+      # BAD marker defaults
+      BAD_MARKER_NAME="${BAD_MARKER_NAME:-.bad}"
+      MARK_BAD_ON_ROLLBACK="${MARK_BAD_ON_ROLLBACK:-true}"
+
+      # ── 로컬 유틸 ─────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      need() { command -v "$1" >/dev/null 2>&1; }
+      timestamp() { date +%Y%m%d%H%M%S; }
+      is_link() { sudo test -L "$1"; }
+      is_dir()  { sudo test -d "$1"; }
+      is_any()  { sudo test -e "$1" -o -L "$1"; }
+
+      ln_s_safe() {
+        local tgt="$1" link="$2"
+        link="${link%/}"
+        sudo ln -sT "$tgt" "$link" 2>/dev/null || sudo ln -s "$tgt" "$link"
+      }
+
+      set_live_symlink() {
+        local target_dir="$1"
+        local tmp_link="${LIVE_LINK}.new.$(timestamp)"
+        ln_s_safe "$target_dir" "$tmp_link"
+        sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || {
+          sudo rm -rf --one-file-system "$LIVE_LINK"
+          sudo mv "$tmp_link" "$LIVE_LINK"
+        }
+        log "LIVE -> $target_dir"
+      }
+
+      migrate_live_once() {
+        # 배포 함수와 동일: LIVE가 '링크가 아닌' 엔트리면 releases로 이동(legacy)
+        local releases_base_dir="$1"
+        sudo mkdir -p "$releases_base_dir"
+
+        log "MIGRATE: WEBAPPS_ROOT=$WEBAPPS_ROOT APP_NAME=$APP_NAME"
+        log "MIGRATE: LIVE_LINK=$LIVE_LINK"
+        log "MIGRATE: probe: $(sudo ls -ld "$LIVE_LINK" 2>/dev/null || echo '<not-found-or-no-perm>')"
+
+        if is_link "$LIVE_LINK"; then
+          log "MIGRATE: skip (already symlink) -> $(sudo readlink -f "$LIVE_LINK" 2>/dev/null || echo '<broken>')"
+          return 0
+        fi
+
+        if is_dir "$LIVE_LINK"; then
+          local legacy="${releases_base_dir}/${APP_NAME}-legacy-$(timestamp)"
+          log "MIGRATE: moving existing DIR to legacy: $legacy"
+          sudo mv "$LIVE_LINK" "$legacy"
+          log "MIGRATE: moved dir -> $(sudo ls -ld "$legacy")"
+        elif is_any "$LIVE_LINK"; then
+          local legacy="${releases_base_dir}/${APP_NAME}-legacy-$(timestamp).file"
+          log "MIGRATE: moving existing FILE to legacy: $legacy"
+          sudo mv "$LIVE_LINK" "$legacy"
+          log "MIGRATE: moved file -> $(sudo ls -l "$legacy")"
+        else
+          log "MIGRATE: nothing to move (not found / no perm)"
+        fi
+      }
+
+      tomcat_reload_or_restart() {
+        if [ "$HOT_RELOAD" = "true" ] && [ -n "$DEPLOY_USER" ] && [ -n "$DEPLOY_PASS" ] && need curl; then
+          # Tomcat Manager 핫리로드
+          curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" >>"$LOG" 2>&1 || true
+          log "Tomcat manager reload requested"
+          return 0
+        fi
+        if need systemctl; then
+          if sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null; then
+            log "Tomcat reload ok"
+            return 0
+          fi
+          log "Reload unsupported → restart"
+          sudo systemctl restart "$TOMCAT_SERVICE"
+          log "Tomcat restart ok"
+        fi
+      }
+
+      health_wait() {
+        url="$1" timeout="$2" interval="$3"
+        elapsed=0
+        while [ "$elapsed" -lt "$timeout" ]; do
+          if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
+            log "Health OK: $url"
+            return 0
+          fi
+          sleep "$interval"
+          elapsed=$((elapsed+interval))
+        done
+        return 1
+      }
+
+      # ── 필수 env ─────────────────────────────────────
+      : "${CONTEXT_PATH:?}"
+      : "${WEBAPPS_ROOT:?}"
+      : "${RELEASES_BASE:?}"
+      : "${TOMCAT_SERVICE:?}"
+      : "${ROLLBACK_TO_VERSION:-}"
+      : "${HEALTH_MODE:?}"
+      : "${HEALTH_URL_OVERRIDE:-}"
+      : "${HC_TIMEOUT:?}"
+      : "${HC_INTERVAL:?}"
+      : "${REMOTE_DIR:?}"
+      : "${RESTORE_LOG_NAME:?}"
+      : "${HOT_RELOAD:?}"
+      : "${DEPLOY_USER:-}"
+      : "${DEPLOY_PASS:-}"
+      : "${WAS_URL:?}"
+
+      APP_NAME="$(printf "%s" "${CONTEXT_PATH#/}")"
+      LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
+      APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
+
+      ART_DIR="$REMOTE_DIR/artifacts"
+      LOG="$ART_DIR/$RESTORE_LOG_NAME"
+      OUT_ZIP="$ART_DIR/symlink-rollback-artifacts.zip"
+      sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
+      : > "$LOG"
+
+      # ── 도구 준비 ─────────────────────────────────────
+      for t in ln readlink zip ls curl; do
+        if ! need "$t"; then
+          if   need apk; then sudo apk add --no-cache "$t" || true
+          elif need apt-get; then sudo apt-get update -y && sudo apt-get install -y "$t" || true
+          elif need dnf; then sudo dnf install -y "$t" || true
+          fi
+        fi
+      done
+      need ln || fail "ln not available"
+      need readlink || fail "readlink not available"
+      need zip || fail "zip not available"
+      need ls  || fail "ls not available"
+      need curl || log "curl missing (health/manager reload may be limited)"
+
+      # ── 현재 링크/대상 후보 계산 ─────────────────────
+      current=""
+      if is_link "$LIVE_LINK"; then
+        current="$(sudo readlink -f "$LIVE_LINK" || true)"
+      fi
+      echo "CURRENT=$current" | tee -a "$LOG"
+
+      # LIVE가 심링크가 아니면(초기 전환 미수행 상태 등) 먼저 legacy로 이동시켜 심링크 체계로 통일
+      if ! is_link "$LIVE_LINK"; then
+        migrate_live_once "$APP_RELEASES_DIR"
+      fi
+
+      # 최신(수정시각 내림차순)으로 정렬된 후보 (BAD 마커가 있으면 제외)
+      mapfile -t rels < <(
+        ls -1dt "${APP_RELEASES_DIR}/${APP_NAME}-"* 2>/dev/null \
+        | while read -r d; do
+            if sudo test -f "$d/$BAD_MARKER_NAME"; then
+              continue
+            fi
+            printf "%s\n" "$d"
+          done
+      )
+
+      choose_prev() {
+        # rels: 최신순 (rels[0]가 가장 최신, legacy 포함)
+        [ "${#rels[@]}" -ge 1 ] || return 1
+
+        # current가 rels 안에 있으면 그 '다음(직전)'을 선택
+        if [ -n "$current" ]; then
+          local i=0
+          while [ $i -lt ${#rels[@]} ]; do
+            # 실경로 비교(심링크/바인드 마운트 대비)
+            if [ "$(sudo readlink -f "${rels[$i]}")" = "$current" ]; then
+              if [ $((i+1)) -lt ${#rels[@]} ]; then
+                printf "%s\n" "${rels[$((i+1))]}"
+                return 0
+              else
+                # current가 가장 오래된 항목이면 자기 자신 외엔 없음 → 그나마 current 반환
+                printf "%s\n" "${rels[$i]}"
+                return 0
+              fi
+            fi
+            i=$((i+1))
+          done
+          # current가 목록에 없으면 최신의 '직전'으로 롤백
+          if [ "${#rels[@]}" -ge 2 ]; then
+            printf "%s\n" "${rels[1]}"
+          else
+            printf "%s\n" "${rels[0]}"
+          fi
+        else
+          # current를 모르면: 최신의 '직전'을 우선 선택(진짜 롤백)
+          if [ "${#rels[@]}" -ge 2 ]; then
+            printf "%s\n" "${rels[1]}"
+          else
+            printf "%s\n" "${rels[0]}"
+          fi
+        fi
+      }
+
+      # ROLLBACK_TO_VERSION 우선
+      target=""
+      if [ -n "$ROLLBACK_TO_VERSION" ]; then
+        cand="${APP_RELEASES_DIR}/${APP_NAME}-${ROLLBACK_TO_VERSION}"
+        if [ -d "$cand" ]; then
+          target="$cand"
+        else
+          fail "rollback target version not found: $cand"
+        fi
+      else
+        target="$(choose_prev || true)"
+      fi
+
+      # 자기 자신으로의 롤백 방지: target이 current와 같으면 다음 후보를 찾아본다
+      if [ -n "$target" ] && [ -n "$current" ] && [ "$(sudo readlink -f "$target")" = "$current" ] && [ "${#rels[@]}" -ge 2 ]; then
+        # rels에서 current가 아닌 첫 번째 항목 선택
+        for cand in "${rels[@]}"; do
+          if [ "$(sudo readlink -f "$cand")" != "$current" ]; then
+            target="$cand"; break
+          fi
+        done
+      fi
+
+      # 최종 검증
+      [ -n "$target" ] && [ -d "$target" ] || {
+        echo "AVAILABLE_RELEASES:" | tee -a "$LOG"
+        printf ' - %s\n' "${rels[@]}" | tee -a "$LOG" || true
+        fail "rollback target not resolvable"
+      }
+      echo "TARGET=$target" | tee -a "$LOG"
+
+      # ── 전환 ─────────────────────────────────────────
+      set_live_symlink "$target"
+
+      # ── 서비스 갱신 ───────────────────────────────────
+      tomcat_reload_or_restart
+
+      # ── 헬스체크 ──────────────────────────────────────
+      hc_url=""
+      if [ -n "$HEALTH_URL_OVERRIDE" ]; then
+        hc_url="$HEALTH_URL_OVERRIDE"
+      else
+        case "$HEALTH_MODE" in
+          actuator) hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
+          page)     hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
+          none)     hc_url="" ;;
+          *)        hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
+        esac
+      fi
+
+      if [ -n "$hc_url" ] && need curl; then
+        log "Health wait: $hc_url (timeout=${HC_TIMEOUT}s, mode=${HEALTH_MODE})"
+        health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL" || fail "rollback health failed: $hc_url"
+      else
+        log "Health check skipped"
+      fi
+
+      # BAD marker (only after successful rollback)
+      if [ -n "$current" ] && [ -d "$current" ] && [ "$MARK_BAD_ON_ROLLBACK" = "true" ]; then
+        sudo sh -c "printf 'marked bad on %s\n' \"$(date -Ins)\" > '$current/$BAD_MARKER_NAME'"
+      fi
+
+      # ── 산출물 ────────────────────────────────────────
+      {
+        echo "ROLLED_BACK_TO=$target"
+        echo "LIVE_LINK=$LIVE_LINK"
+      } > "$ART_DIR/.env"
+
+      sudo rm -f "$OUT_ZIP"
+      zip -r "$OUT_ZIP" "$LOG" "$ART_DIR/.env" >/dev/null 2>&1 || true
+      ok "Symlink rollback completed"
+      echo "$OUT_ZIP"
+    REMOTE_SH
+
+      # ── 원격 실행 ─────────────────────────────────────
+      log "▶ Executing symlink rollback via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "CONTEXT_PATH='$(shq "$CONTEXT_PATH")'" \
+        "WEBAPPS_ROOT='$(shq "$webapps_root")'" \
+        "RELEASES_BASE='$(shq "$releases_base")'" \
+        "TOMCAT_SERVICE='$(shq "$tomcat_service")'" \
+        "ROLLBACK_TO_VERSION='$(shq "$rollback_to_version")'" \
+        "HEALTH_MODE='$(shq "$health_mode")'" \
+        "HEALTH_URL_OVERRIDE='$(shq "$health_url_override")'" \
+        "HC_TIMEOUT='$(shq "$hc_timeout")'" \
+        "HC_INTERVAL='$(shq "$hc_interval")'" \
+        "RESTORE_LOG_NAME='$(shq "$restore_log_name")'" \
+        "HOT_RELOAD='$(shq "$hot_reload")'" \
+        "DEPLOY_USER='$(shq "$deploy_user")'" \
+        "DEPLOY_PASS='$(shq "$deploy_pass")'" \
+        "WAS_URL='$(shq "$WAS_URL")'" \
+        "MARK_BAD_ON_ROLLBACK='$(shq "${MARK_BAD_ON_ROLLBACK:-true}")'" \
+        "BAD_MARKER_NAME='$(shq "${BAD_MARKER_NAME:-.bad}")'" \
+        'export REMOTE_DIR CONTEXT_PATH WEBAPPS_ROOT RELEASES_BASE TOMCAT_SERVICE ROLLBACK_TO_VERSION HEALTH_MODE HEALTH_URL_OVERRIDE HC_TIMEOUT HC_INTERVAL RESTORE_LOG_NAME HOT_RELOAD DEPLOY_USER DEPLOY_PASS WAS_URL MARK_BAD_ON_ROLLBACK BAD_MARKER_NAME; bash -s' \
+        < "$remote_script" | tee /tmp/_symlink_rollback_out.txt
+
+      # ── 산출물 회수 ───────────────────────────────────
+      remote_zip_path="$(tail -n1 /tmp/_symlink_rollback_out.txt || true)"
+      [ -z "$remote_zip_path" ] && remote_zip_path="${REMOTE_DIR}/artifacts/symlink-rollback-artifacts.zip"
+      local_dir="${CI_PROJECT_DIR:-.}/artifacts"
+      mkdir -p "$local_dir"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip_path" "$local_dir/" || true
+
+      rm -f "$remote_script" /tmp/_symlink_rollback_out.txt || true
+      ok "Symlink rollback finished"
+    }
+

@@ -1,0 +1,81 @@
+# ────────────────────────────────────────────────
+# 개발 Snapshot War 통배포
+# ────────────────────────────────────────────────
+.deploy_war_staging:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+    GIT_CHECKOUT: "false"
+  environment:
+    name: staging
+    url: "http://$WAS_URL$CONTEXT_PATH/"
+  script:
+    - !reference [.fn_tomcat_deploy_snapshot_war, script]
+    - fn_tomcat_deploy_snapshot_war
+  artifacts:
+    name: "deploy-war-snapshot-$CI_COMMIT_TAG"
+    paths:
+      - artifacts/deploy-snapshot-war-artifacts.zip
+    expire_in: 1 day
+
+# ────────────────────────────────────────────────
+# 운영 Release War 통배포
+# ────────────────────────────────────────────────
+.deploy_war_prod:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+    GIT_CHECKOUT: "false"
+  environment:
+    name: production
+    url: "http://$WAS_URL$CONTEXT_PATH/"
+  script:
+    - !reference [.fn_tomcat_deploy_war, script]
+    - fn_tomcat_deploy_war
+  artifacts:
+    name: "deploy-war-$CI_COMMIT_TAG"
+    paths:
+      - artifacts/deploy-war-artifacts.zip
+    expire_in: 1 day
+
+# ────────────────────────────────────────────────
+# 운영 Diff 배포
+# ────────────────────────────────────────────────
+.deploy_diff:
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+    GIT_CHECKOUT: "false"
+  environment:
+    name: production
+    url: "http://$WAS_URL$CONTEXT_PATH/"
+  script:
+    - !reference [.fn_tomcat_diff_deploy, script]
+    - fn_tomcat_diff_deploy  
+  artifacts:
+    name: "deploy-diff-$CI_COMMIT_TAG"
+    paths:
+      - artifacts/diff-deploy-artifacts.zip
+    expire_in: 1 day
+
+# ────────────────────────────────────────────────
+# 운영 Symbolic Link 전환 배포
+# ────────────────────────────────────────────────
+.deploy_symlink:
+  stage: deploy
+  variables: 
+    GIT_STRATEGY: none
+    GIT_CHECKOUT: "false"      
+    HEALTH_MODE: "none"  
+    HOT_RELOAD: "false"
+  environment:
+    name: production
+    url: "http://$WAS_URL$CONTEXT_PATH/"
+  script:
+    - !reference [.fn_tomcat_symbolic_deploy, script]
+    - fn_tomcat_symbolic_deploy
+  artifacts:
+    name: "deploy-symlink-$CI_COMMIT_TAG"
+    paths:
+      - artifacts/symlink-deploy-artifacts.zip
+    expire_in: 1 day

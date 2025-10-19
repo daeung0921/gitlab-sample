@@ -1,0 +1,16 @@
+- id: "java.exposure"
+  patterns:
+  - pattern-either:
+    - pattern: "$TYPE [] $MASK;"
+    - pattern: "$TYPE [] $MASK = ...;"
+    - pattern: "$TYPE $MASK;"
+    - pattern: "$TYPE $MASK = ...;"
+  - metavariable-regex:
+      metavariable: "$MASK"
+      regex: "(?i)[^\\[]*(password|pass|passwd|pwd|secret|token|secrete)[^\\]]*"
+  message: "My personal rule -- Hardcoded secret detected"
+  metadata:
+    cwe: "CWE-200: Exposure of Sensitive Information to an Unauthorized Actor"
+  severity: "WARNING"
+  languages:
+  - "java"

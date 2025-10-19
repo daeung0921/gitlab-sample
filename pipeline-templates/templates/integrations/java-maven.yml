@@ -1,0 +1,35 @@
+# Maven 빌드 템플릿
+.maven_build: 
+  stage: build
+  script: 
+    - !reference [.fn_mvn_build, script] 
+    - fn_mvn_build
+  artifacts:
+    name: "build-artifacts-$CI_COMMIT_REF_SLUG"
+    paths:
+      - build-artifact.zip
+    reports:
+      dotenv: build_status.env       
+    expire_in: 1 day
+    when: on_success
+  after_script:
+    - echo "BUILD_STATUS=$CI_JOB_STATUS" > build_status.env
+
+# Maven 테스트 템플릿
+.maven_test: 
+  stage: test
+  script: 
+    - !reference [.fn_mvn_test, script] 
+    - fn_mvn_test
+    - unzip -o artifacts/test-reports.zip -d reports
+  artifacts:
+    name: "test-reports-$CI_COMMIT_REF_SLUG"
+    paths:
+      - reports/
+    reports:
+      junit: reports/target/surefire-reports/TEST-*.xml
+      coverage_report:
+        coverage_format: jacoco
+        path: reports/target/site/jacoco/jacoco.xml
+    expire_in: 1 day
+    when: on_success

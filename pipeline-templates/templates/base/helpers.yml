@@ -1,0 +1,267 @@
+# ────────────────────────────────────────────────
+# SSH 초기화 스니펫
+# ────────────────────────────────────────────────
+.init-remote:
+  before_script:
+    - echo "▶Init SSH for remote operations"
+    - apk add --no-cache openssh-client zip
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - '[ -n "$REMOTE_DEPLOY_HOST" ] && ssh-keyscan -p 22 "$REMOTE_DEPLOY_HOST" >> ~/.ssh/known_hosts || true'
+    - chmod 644 ~/.ssh/known_hosts
+    - eval $(ssh-agent)
+    - |
+      if [ -n "$SSH_PRIVATE_KEY" ]; then
+        echo "$SSH_PRIVATE_KEY" > ~/.ssh/remote_key
+        chmod 400 ~/.ssh/remote_key
+        [ "$(tail -c1 ~/.ssh/remote_key)" != "" ] && echo >> ~/.ssh/remote_key
+        ssh-add ~/.ssh/remote_key
+      fi
+
+# ────────────────────────────────────────────────
+# fn_ssh_exec 함수
+#     fn_ssh_exec <cmd...>
+# 사용 예:
+#   script:
+#     - !reference [.fn_ssh_exec, script]
+#     - fn_ssh_exec "ls -al"
+# ────────────────────────────────────────────────
+.fn_ssh_exec:
+  script:
+    - |
+      fn_ssh_exec() {
+        ssh "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" "export REMOTE_DIR='$REMOTE_DIR'; cd \$REMOTE_DIR && \$*"
+      }
+
+# ────────────────────────────────────────────────
+# fn_ssh_fetch 함수
+#     fn_ssh_fetch <remote_path> [local_path=.]
+# 사용 예:
+#   script:
+#     - !reference [.fn_ssh_fetch, script]
+#     - fn_ssh_fetch "artifacts/file.zip" "./"
+# ────────────────────────────────────────────────
+.fn_ssh_fetch:
+  script:
+    - |
+      fn_ssh_fetch() {
+        local remote_path=$1
+        local local_path=${2:-.}
+        scp "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$REMOTE_DIR/$remote_path" "$local_path"
+      }
+
+# ────────────────────────────────────────────────
+# fn_ssh_push 함수
+#    fn_ssh_push <local_path> [remote_path=$REMOTE_DIR]
+# 사용 예:
+#   script:
+#     - !reference [.fn_ssh_push, script]
+#     - fn_ssh_push "./file.txt" "/tmp"
+# ────────────────────────────────────────────────
+.fn_ssh_push:
+  script:
+    - |
+      fn_ssh_push() {
+        local local_path=$1
+        local remote_path=${2:-$REMOTE_DIR}
+        scp "$local_path" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_path"
+      }
+
+# ────────────────────────────────────────────────
+# fn_ssh_zip_artifacts 함수
+#     fn_ssh_zip_artifacts <zip_name> <paths...>
+# 사용 예:
+#   script:
+#     - !reference [.fn_ssh_zip_artifacts, script]
+#     - fn_ssh_zip_artifacts "backup.zip" "logs" "conf"
+# ────────────────────────────────────────────────
+.fn_ssh_zip_artifacts:
+  script:
+    - |
+      fn_ssh_zip_artifacts() {
+        local output=$1
+        shift
+        ssh "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" "export REMOTE_DIR='$REMOTE_DIR'; cd \$REMOTE_DIR && mkdir -p artifacts && zip -r artifacts/$output $* || true"
+      }
+
+# ────────────────────────────────────────────────
+# fn_jira_comment 함수
+#   커밋 메시지(CI_COMMIT_MESSAGE)에서 JIRA 티켓 키(예: ABC-123)를 추출하여
+#   지정한 메시지(JIRA_MESSAGE)를 해당 티켓에 코멘트로 등록한다.
+#
+# ▶ 사용 방법:
+#   script:
+#     - !reference [.fn_jira_comment, script]
+#     - fn_jira_comment
+#
+# ▶ 제어용 환경 변수 목록:
+#   - JIRA_SERVER      (필수) JIRA 서버 베이스 URL
+#                       예: https://company00.jira.mousoft.co.kr
+#   - JIRA_TOKEN       (필수) JIRA 접근 토큰 (프로젝트/그룹 CI/CD 변수로 설정 권장)
+#   - JIRA_MESSAGE     (선택) 코멘트로 남길 메시지
+#                       기본값: "Pipeline: $CI_PIPELINE_URL"
+#   - CI_COMMIT_MESSAGE(자동) 커밋 메시지 (여기서 '[A-Z]+-[0-9]+' 형태의 티켓 키를 추출)
+#
+# ▶ 작동 방식:
+#   1) CI_COMMIT_MESSAGE에서 정규식으로 첫 번째 JIRA 티켓 키를 추출
+#   2) 티켓을 찾지 못하면 작업을 건너뜀(성공 종료)
+#   3) (필요 시) curl을 자동 설치 후 JIRA REST API로 코멘트 등록
+#
+# ▶ 예시 (GitLab CI):
+#   variables:
+#     JIRA_SERVER: "https://company00.jira.mousoft.co.kr"
+#     # JIRA_TOKEN은 Settings → CI/CD → Variables 에 등록 권장
+#   script:
+#     - !reference [.fn_jira_comment, script]
+#     - JIRA_MESSAGE="✅ Build passed | Pipeline: $CI_PIPELINE_URL" fn_jira_comment
+# ────────────────────────────────────────────────
+.fn_jira_comment:
+  script: |
+    fn_jira_comment() {
+      set -eu
+
+      # 공통 유틸
+      shq() { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }  # shell-safe quoting (SSH/원격셸용)
+      need() { command -v "$1" >/dev/null 2>&1; }
+
+      # tool guards: curl / jq
+      ensure_curl() {
+        if need curl; then return 0; fi
+        echo "[SETUP] installing curl..."
+        if   need apk;     then apk add --no-cache curl ca-certificates >/dev/null 2>&1 || true; update-ca-certificates >/dev/null 2>&1 || true
+        elif need apt-get; then apt-get update -y >/dev/null 2>&1 || true; apt-get install -y curl ca-certificates >/dev/null 2>&1 || true; update-ca-certificates >/dev/null 2>&1 || true
+        elif need dnf;     then dnf install -y curl ca-certificates >/dev/null 2>&1 || true
+        fi
+        need curl || { echo "[ERR] curl not found and cannot install"; exit 127; }
+      }
+      ensure_curl
+
+      ensure_jq() {
+        if need jq; then return 0; fi
+        echo "[SETUP] installing jq..."
+        if   need apk;     then apk add --no-cache jq >/dev/null 2>&1 || true
+        elif need apt-get; then apt-get update -y >/dev/null 2>&1 || true; apt-get install -y jq >/dev/null 2>&1 || true
+        elif need dnf;     then dnf install -y jq >/dev/null 2>&1 || true
+        fi
+        need jq || { echo "[ERR] jq not found and cannot install"; exit 127; }
+      }
+      ensure_jq
+
+      # helpers
+      call_jira_api() {
+        local method=$1; local endpoint=$2; local data=${3:-}
+        local out; out=$(mktemp); local code
+        if [ -n "$data" ]; then
+          code=$(curl -s -w "%{http_code}" -X "$method" \
+            -H "Authorization: Bearer $JIRA_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$data" "${JIRA_SERVER%/}/rest/api/2/${endpoint}" -o "$out")
+        else
+          code=$(curl -s -w "%{http_code}" -X "$method" \
+            -H "Authorization: Bearer $JIRA_TOKEN" \
+            "${JIRA_SERVER%/}/rest/api/2/${endpoint}" -o "$out")
+        fi
+        if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+          cat "$out"; rm -f "$out"; return 0
+        else
+          echo "HTTP $code: $(cat "$out")" >&2; rm -f "$out"; return 1
+        fi
+      }
+      get_jira_ticket() { echo "${CI_COMMIT_MESSAGE:-}" | grep -oE '[A-Z]+-[0-9]+' | head -1 || true; }
+
+      # main
+      local ticket msg payload
+      ticket=$(get_jira_ticket)
+      [ -n "$ticket" ] || { echo "No JIRA ticket. Skip."; return 0; }
+
+      msg="${JIRA_MESSAGE:-"Pipeline: $CI_PIPELINE_URL"}"
+      payload=$(jq -n --arg body "$msg" '{body:$body}')
+
+      call_jira_api POST "issue/$ticket/comment" "$payload" >/dev/null
+      echo "[OK] comment added to $ticket"
+    }
+
+
+# ────────────────────────────────────────────────
+# fn_jira_attach 함수
+#   커밋 메시지에서 JIRA 티켓 키를 추출하여,
+#   지정한 파일(JIRA_ATTACH_FILE)을 해당 티켓에 첨부한다.
+#
+# ▶ 사용 방법:
+#   script:
+#     - !reference [.fn_jira_attach, script]
+#     - fn_jira_attach
+#
+# ▶ 제어용 환경 변수 목록:
+#   - JIRA_SERVER       (필수) JIRA 서버 베이스 URL
+#   - JIRA_TOKEN        (필수) JIRA 접근 토큰 (CI/CD 변수 권장)
+#   - JIRA_ATTACH_FILE  (필수) 첨부할 파일 경로 (Runner 파일시스템 상 경로)
+#   - CI_COMMIT_MESSAGE (자동) 커밋 메시지 (티켓 키 추출용)
+#
+# ▶ 작동 방식:
+#   1) CI_COMMIT_MESSAGE에서 티켓 키 추출
+#   2) (필요 시) curl을 자동 설치
+#   3) JIRA_ATTACH_FILE 경로의 파일 존재 확인 (없으면 Skip)
+#   4) JIRA REST API(attachments)로 파일 업로드
+#
+# ▶ 예시 (GitLab CI):
+#   artifacts:
+#     paths: [ security_report.json ]
+#   script:
+#     - !reference [.fn_jira_attach, script]
+#     - JIRA_ATTACH_FILE="security_report.json" fn_jira_attach
+# ────────────────────────────────────────────────
+.fn_jira_attach:
+  script: |
+    fn_jira_attach() {
+      set -eu
+
+      # 공통 유틸
+      need() { command -v "$1" >/dev/null 2>&1; }
+      ensure_curl() {
+        if need curl; then return 0; fi
+        echo "[SETUP] installing curl..."
+        if   need apk;     then apk add --no-cache curl ca-certificates >/dev/null 2>&1 || true; update-ca-certificates >/dev/null 2>&1 || true
+        elif need apt-get; then apt-get update -y >/dev/null 2>&1 || true; apt-get install -y curl ca-certificates >/dev/null 2>&1 || true; update-ca-certificates >/dev/null 2>&1 || true
+        elif need dnf;     then dnf install -y curl ca-certificates >/dev/null 2>&1 || true
+        fi
+        need curl || { echo "[ERR] curl not found and cannot install"; exit 127; }
+      }
+      ensure_curl
+
+      get_jira_ticket() { echo "${CI_COMMIT_MESSAGE:-}" | grep -oE '[A-Z]+-[0-9]+' | head -1 || true; }
+
+      local ticket file code attempt max sleepsec
+      ticket=$(get_jira_ticket)
+      [ -n "$ticket" ] || { echo "No JIRA ticket. Skip."; return 0; }
+
+      file="${JIRA_ATTACH_FILE:-}"
+      [ -n "$file" ] && [ -f "$file" ] || { echo "No attach file. Skip."; return 0; }
+
+      attempt=1; max=4; sleepsec=3
+      while :; do
+        code=$(curl -s -w "%{http_code}" -X POST \
+          -H "Authorization: Bearer $JIRA_TOKEN" -H "X-Atlassian-Token: no-check" \
+          -F "file=@${file}" \
+          "${JIRA_SERVER%/}/rest/api/2/issue/${ticket}/attachments" -o /dev/null || true)
+
+        # 성공(2xx)
+        if [ -n "$code" ] && [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+          echo "[OK] attached $file to $ticket"
+          return 0
+        fi
+
+        # 5xx/429 은 재시도, 그 외는 즉시 실패
+        if [ -n "$code" ] && { [ "$code" -ge 500 ] || [ "$code" -eq 429 ]; }; then
+          if [ "$attempt" -lt "$max" ]; then
+            echo "[WARN] attach failed (HTTP $code). retry $attempt/$max in ${sleepsec}s..."
+            sleep "$sleepsec"
+            attempt=$((attempt+1))
+            sleepsec=$((sleepsec*2))
+            continue
+          fi
+        fi
+
+        echo "[WARN] attach failed (HTTP ${code:-'curl-error'})"
+        return 1
+      done
+    }

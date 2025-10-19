@@ -1,0 +1,113 @@
+include:
+  - local: /templates/base/helpers.yml
+
+# ────────────────────────────────────────────────
+# default: 앵커 머지로 공통 설정 적용 
+# ────────────────────────────────────────────────
+default:
+  image: registry.gitlab.com/platter-common/containers/gitlab-remote-base:latest
+  before_script:
+    - !reference [.init-remote, before_script]
+
+# ────────────────────────────────────────────────
+# 전역 변수
+# ────────────────────────────────────────────────
+variables: 
+  # ─── SSH / Remote Workspace ───────────────────────────────────────────────
+  REMOTE_DEPLOY_HOST: ""                         # 운영 Tomcat 서버
+  REMOTE_DEPLOY_USER: ""                         # SSH 사용자
+  REMOTE_DEPLOY_PORT: "22"                       # SSH 포트
+  REMOTE_DIR: "/tmp/gitlab-build-$CI_PIPELINE_ID" # 원격 작업/아티팩트 디렉터리
+  REMOTE_SETTINGS: "/opt/apache-maven/conf/settings.xml" # 원격 Maven settings.xml 경로
+
+  # ─── Nexus / Artifact ─────────────────────────────────────────────────────
+  NEXUS_URL: "https://nexus.idtice.com"          # Nexus 서버 URL
+  RELEASE_REPO: ""                               # Release repo 이름
+  SNAPSHOT_REPO: ""                              # Snapshot repo 이름
+  RELEASE_REPO_URL: "${NEXUS_URL}/repository/${RELEASE_REPO}"
+  SNAPSHOT_REPO_URL: "${NEXUS_URL}/repository/${SNAPSHOT_REPO}"
+  NEXUS_USER: ""                                 # Nexus 계정 (보호 필요)
+  NEXUS_PASS: ""                                 # Nexus 비밀번호 (보호 필요)
+  GROUP_ID: ""                                   # Maven Group ID
+  ARTIFACT_ID: ""                                # Maven Artifact ID
+  COMMIT_TAG: "$CI_COMMIT_TAG"                   # NEW 버전 태그 (v 접두어 자동 제거)
+
+  # ─── Application / Tomcat Paths ───────────────────────────────────────────
+  CONTEXT_PATH: ""                               # Tomcat 컨텍스트 (예: /devops)
+  TOMCAT_SERVICE: "tomcat"                       # systemd 서비스명 (tomcat|tomcat9 등)
+  TOMCAT_WEBAPPS_DIR: "/opt/tomcat/webapps"      # LIVE 심링크 위치 (webapps/<APP>)
+  RELEASES_BASE: "/opt/tomcat/releases"          # 릴리스 저장 루트
+  KEEP_RELEASES: "5"                             # 보관할 최신 릴리스 개수
+
+  # ─── Tomcat Manager (Optional) ────────────────────────────────────────────
+  HOT_RELOAD: "false"                            # true면 manager/text reload 시도
+  DEPLOY_USER: ""                                # manager-script 권한 유저
+  DEPLOY_PASS: ""                                # manager-script 비밀번호
+  WAS_URL: ""                                   # was manager 호출/페이지 헬스체크용 HOST:PORT 
+
+  # ─── Health Check Policy ─────────────────────────────────────────────────
+  HEALTH_MODE: "actuator"                        # actuator | page | none
+  HEALTH_URL_OVERRIDE: ""                        # 지정 시 최우선 URL
+  HEALTHCHECK_TIMEOUT: "90"                      # 최대 대기(초)
+  HEALTHCHECK_INTERVAL: "2"                      # 재시도 간격(초)
+
+  # ─── Logging / Artifacts ─────────────────────────────────────────────────
+  DEPLOY_LOG_NAME: "symlink-deploy.log"            # 배포 로그 파일명
+  RESTORE_LOG_NAME: "symlink-rollback.log"       # 롤백 로그 파일명
+
+  # ─── Rollback Options (Symlink) ──────────────────────────────────────────
+  ROLLBACK_TO_VERSION: ""                        # 지정 시 해당 버전으로 롤백, 미지정 시 자동 이전 선택
+
+  # ─── JIRA 통합 옵션 ──────────────────────────────────────────────────────
+  JIRA_SERVER: "https://company00.jira.mousoft.co.kr"
+  JIRA_TOKEN: ""
+  JIRA_TICKET_REGEX: '[A-Z]+-[0-9]+'             # 티켓 키 추출 정규식
+  JIRA_MESSAGE: "Pipeline: $CI_PIPELINE_URL"     # 기본 코멘트 메시지
+  JIRA_ATTACH_FILE: ""                           # 첨부 파일 경로
+  JIRA_CURL_SILENT: "true"                       # true면 -s 사용
+  JIRA_CURL_RETRY: "2"                           # 재시도 횟수
+  JIRA_CURL_RETRY_DELAY: "2"                     # 재시도 간격(초)
+
+  # ─── LEGACY: Diff/Partial Deploy 옵션 (호환 주석용) ─────────────────────
+  # ※ 현재 표준은 “심링크 전환 배포”입니다. 아래 변수들은 과거 diff/rsync 기반 호환용입니다.
+  DIFF_USE_RSYNC: "true"                         # (미사용) true=rsync, false=scp
+  DIFF_HOT_RELOAD: "false"                       # (미사용) 환경에 따라 미지원
+  #DEPLOY_LOG_NAME: "diff-deploy.log"            # (미사용) 이전 로깅 파일명
+
+  # ─── LEGACY: Diff/Partial Deploy Backup 정책 (호환 주석용) ───────────── 
+  DIFF_BACKUP_DIR: "/var/backups/tomcat"         # LIVE 백업 루트
+  DIFF_BACKUP_PREFIX: "diff-backup"              # 백업 접두어
+  DIFF_BACKUP_RETENTION: "5"                     # (배포 시 회전이 필요하면 사용)
+  DIFF_BACKUP_BEFORE: "true"                     # 배포 전 스냅샷 여부
+  RESTORE_BACKUP_FILE: ""                        # 특정 tar.gz 지정 시 해당 버전 복원
+  RESTORE_LOG_NAME: "diff-rollback.log"
+  RESTORE_FALLBACK_PREV: "true"                  # 헬스 실패 시 이전 백업 자동 재시도
+
+
+# ────────────────────────────────────────────────
+# 공통 캐시 전략
+# ────────────────────────────────────────────────
+.cache_strategy:
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .m2/repository/
+      - .gradle/caches/
+      - node_modules/
+    policy: pull-push
+
+# ────────────────────────────────────────────────
+# 실행 규칙
+# ────────────────────────────────────────────────
+.release_rules:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: on_success
+    - when: never
+
+.mr_rules:
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'

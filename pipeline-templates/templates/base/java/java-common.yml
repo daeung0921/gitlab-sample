@@ -1,0 +1,9 @@
+include:
+  - local: /templates/base/java/java-helpers.yml
+
+# ────────────────────────────────────────────────
+# 전역 변수
+# ────────────────────────────────────────────────
+variables:
+  # Maven 관련
+  MAVEN_CLI_OPTS: "-B"

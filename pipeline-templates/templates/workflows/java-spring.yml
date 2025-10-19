@@ -1,0 +1,18 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+
+# ============================================
+# templates/workflows/java-spring.yml
+# ============================================
+include:
+  - local: /templates/base/common.yml
+  - local: /templates/base/java/java-common.yml  
+  - local: /templates/base/stages.yml 
+  - local: /templates/integrations/java-maven.yml
+  - local: /templates/packages/java-package.yml
+  - local: /templates/deployments/java-deploy.yml
+  - local: /templates/deployments/java-rollback.yml
+  - local: /templates/notifications/jira.yml

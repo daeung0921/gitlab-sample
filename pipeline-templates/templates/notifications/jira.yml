@@ -1,0 +1,19 @@
+.jira_comment:
+  script:
+    - !reference [.fn_jira_comment, script]
+    - fn_jira_comment
+  before_script: []
+  allow_failure: true      
+  variables:
+    GIT_STRATEGY: none      # ← 소스 체크아웃 하지 않음
+    GIT_CHECKOUT: "false"   # (보강용) git checkout 완전 비활성화
+
+.jira_attach:
+  script:
+    - !reference [.fn_jira_attach, script]
+    - fn_jira_attach
+  before_script: []
+  allow_failure: true     
+  variables:
+    GIT_STRATEGY: none      # ← 소스 체크아웃 하지 않음
+    GIT_CHECKOUT: "false"   # (보강용) git checkout 완전 비활성화    
