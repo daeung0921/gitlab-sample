@@ -1216,66 +1216,69 @@
 # 함수: fn_tomcat_diff_deploy
 #
 # 목적:
-#   - /opt/tomcat/artifacts/<APP>/<APP>-<DEPLOY_VERSION> (NEW_DIR) 과
-#     현재 LIVE 심링크가 가리키는 실디렉터리(BASE_DIR)를 비교해
-#     변경 파일만 반영한 스냅샷(TARGET)을 생성하고, LIVE를 원자적으로 전환한다.
+#   - Tomcat 운영 서버에 “실운영 디렉터리 스냅샷(diff)” 방식을 이용해 증분 배포를 수행한다.
+#   - NEW 버전(WAR unzip 결과)과 현재 운영(BASE_DIR)을 비교하여 변경/삭제만 반영하고,
+#     새 스냅샷(TARGET)을 만든 뒤 LIVE 심링크를 원자적으로 전환한다.
 #
 # 작동 개요(코드 기준):
-#   1) NEW_DIR 확인: /opt/tomcat/artifacts/<app>/<app>-<DEPLOY_VERSION>
-#   2) LIVE 기준점 확보:
-#      - LIVE_LINK = <WEBAPPS_ROOT>/<app> (기본 /opt/tomcat/webapps/<app>)
-#      - LIVE가 심링크면 → BASE_DIR = readlink -f(LIVE_LINK)
-#      - LIVE가 디렉터리/파일이면(레거시) → 최초 1회 시드 스냅샷 생성:
-#          /opt/tomcat/releases/<app>/diff-legacy-backup-<ts>
-#        그리고 LIVE를 해당 시드로 심링크 전환(체계 통일)
-#   3) TARGET 생성:
-#      - TARGET = /opt/tomcat/releases/<app>/diff-<app>-<DEPLOY_VERSION>-<ts>
-#      - prev_target(= BASE_DIR 또는 레거시 시드)을 rsync -a --delete로 복제해 시작 상태 구성
-#   4) 변경/삭제 목록 도출:
-#      - rsync --dry-run --delete --out-format='%i %n' NEW_DIR/ → BASE_DIR/
-#      - 변경/추가 파일 → artifacts/changed-files.txt
-#      - 삭제 대상     → artifacts/deleted-files.txt
-#   5) 실제 반영:
-#      - 삭제: deleted-files.txt 에 해당하는 경로를 TARGET에서 제거
-#      - 변경/추가: rsync -a --files-from=changed-files.txt NEW_DIR/ → TARGET/
-#   6) LIVE 전환(원자적):
-#      - ln -sT TARGET <tmp link> → mv -Tf 로 LIVE_LINK 교체(폴백 처리 포함)
-#   7) Tomcat 적용:
-#      - HOT_RELOAD=true & DEPLOY_USER/PASS 있으면 manager reload 호출
+#   1) 버전/경로 결의
+#      - DEPLOY_VERSION = ${COMMIT_TAG#v} (v 접두 제거)
+#      - APP_NAME = ${CONTEXT_PATH#/}
+#      - LIVE_LINK = <WEBAPPS_ROOT>/<app>
+#      - APP_RELEASES_DIR = <RELEASES_BASE>/<app>
+#      - NEW_DIR = <ARTIFACTS_BASE>/<app>/<app>-<DEPLOY_VERSION>
+#   2) NEW_DIR 확보(정책상 자동 생성)
+#      - 디렉터리가 없으면 Nexus(RELEASE_REPO_URL/GROUP_ID/ARTIFACT_ID/DEPLOY_VERSION)에서
+#        WAR를 curl -u로 다운로드 → unzip → NEW_DIR 생성(무결성/구조 검사 포함)
+#   3) 기준 확보/레거시 교정(최초 1회)
+#      - LIVE_LINK가 디렉터리/파일이면 releases/<app>/diff-legacy-backup-<ts>로 seed 후
+#        LIVE_LINK를 해당 seed로 심링크 전환하여 “심링크 체계”로 통일
+#      - BASE_DIR = readlink -f(LIVE_LINK)
+#   4) TARGET 스냅샷 생성
+#      - TARGET = <RELEASES_BASE>/<app>/diff-<app>-<DEPLOY_VERSION>-<ts>
+#      - rsync -a --delete 로 prev_target 스냅샷을 복제하여 초기화
+#   5) 변경/삭제 목록 산출(rsync --dry-run)
+#      - rsync -ai --delete --dry-run --out-format='%i %n'
+#      - _logs/**, *.bad/*.tmp/*.bak/*.swp/*.log 등은 제외
+#      - 결과를 TARGET/_logs/changed-files.txt, deleted-files.txt 에 기록
+#      - 또한 TARGET/_logs/diff-base.env 에 BASE_DIR(직전 운영)을 기록
+#   6) 실제 반영
+#      - 삭제: deleted-files.txt를 기준으로 TARGET에서 제거
+#      - 변경/추가: --files-from=changed-files.txt 로 NEW_DIR → TARGET 동기화
+#   7) LIVE 전환(원자적)
+#      - ln -sT TARGET <tmp> → mv -Tf 로 LIVE_LINK 교체(실패 시 rm → mv 폴백)
+#      - TARGET/_logs/live-pointer.env 에 CURRENT=TARGET, PREV=BASE_DIR 기록
+#   8) Tomcat 반영
+#      - HOT_RELOAD=true & DEPLOY_USER/PASS 있으면 manager/text reload 호출
 #      - 아니면 systemctl reload 실패 시 restart
-#   8) 헬스체크:
-#      - HEALTH_URL_OVERRIDE 우선, 없으면 mode에 따라 기본 URL 구성
-#      - 성공 필수(실패 시 fail)
-#   9) 보관정책:
-#      - /opt/tomcat/releases/<app>/diff-<app>-* 최신순 N개(KEEP_RELEASES)만 유지
-#  10) 산출물 zip 반환:
+#   9) 헬스체크
+#      - HEALTH_URL_OVERRIDE 우선, 없으면 mode에 따라 기본 URL 구성(page/actuator/none)
+#      - 실패 시 fail 처리
+#  10) 보관정책
+#      - releases/<app>/diff-<app>-* 최신순 정렬 후 KEEP_RELEASES 보다 오래된 스냅샷 삭제
+#  11) 산출물(zip) 반환
 #      - 원격: $REMOTE_DIR/artifacts/diff-deploy-artifacts.zip
+#        ( .env, changed-files.txt, deleted-files.txt, diff-base.env, live-pointer.env 포함 )
 #
-# 주요 경로(코드 상수/기본값):
-#   WEBAPPS_ROOT   : /opt/tomcat/webapps (변수 TOMCAT_WEBAPPS_DIR)
-#   RELEASES_BASE  : /opt/tomcat/releases  (변수 RELEASES_BASE)
-#   ARTIFACTS_BASE : /opt/tomcat/artifacts (변수 TOMCAT_ARTIFACTS_DIR)
+# 주요 경로(코드 기본값):
+#   WEBAPPS_ROOT   : /opt/tomcat/webapps
+#   RELEASES_BASE  : /opt/tomcat/releases
+#   ARTIFACTS_BASE : /opt/tomcat/artifacts
 #   LIVE_LINK      : <WEBAPPS_ROOT>/<app>
-#   BASE_DIR       : readlink -f(LIVE_LINK)
-#   NEW_DIR        : <ARTIFACTS_BASE>/<app>/<app>-<DEPLOY_VERSION>
-#   TARGET         : <RELEASES_BASE>/<app>/diff-<app>-<DEPLOY_VERSION>-<ts>
+#   TARGET/_logs   : 스냅샷별 로그/메타 저장 위치(배포/복구 시 rsync 제외)
 #
 # 산출물(원격에 생성):
 #   $REMOTE_DIR/artifacts/
 #     ├── diff-deploy-artifacts.zip
-#     ├── diff-deploy.log                 (DEPLOY_LOG_NAME, 기본 diff-deploy.log)
 #     ├── changed-files.txt
 #     ├── deleted-files.txt
-#     └── .env
-#         - DEPLOYED_VERSION=<DEPLOY_VERSION>
-#         - LIVE_LINK=<LIVE_LINK>
-#         - TARGET=<TARGET>
-#         - BASE_DIR=<BASE_DIR>
-#         - CHANGED=0|1
+#     ├── diff-base.env             (BASE_DIR=<직전 운영 스냅샷>)
+#     └── live-pointer.env          (CURRENT=<이번 운영>, PREV=<직전 운영>)
 #
 # 필수 환경변수(외부 래퍼/CI에서 주입):
 #   REMOTE_DEPLOY_HOST, REMOTE_DEPLOY_USER, REMOTE_DIR,
-#   CONTEXT_PATH (예: /devops), DEPLOY_VERSION
+#   COMMIT_TAG, CONTEXT_PATH,
+#   NEXUS_USER, NEXUS_PASS, RELEASE_REPO_URL, GROUP_ID, ARTIFACT_ID
 #
 # 내부 스크립트가 요구하는 추가 변수(함수에서 기본값 제공/전달):
 #   WEBAPPS_ROOT=/opt/tomcat/webapps
@@ -1291,12 +1294,12 @@
 #   DEPLOY_USER=""
 #   DEPLOY_PASS=""
 #   WAS_URL=127.0.0.1:8080
-#   DEPLOY_LOG_NAME=diff-deploy.log
 #
 # 주의사항(코드 반영됨):
-#   - rsync dry-run 시 --delete가 빠지면 삭제 감지가 되지 않아 stale 파일이 남음.
-#   - LIVE가 디렉터리/파일인 레거시 환경은 자동으로 시드 스냅샷 생성 후 심볼릭 체계로 교정.
+#   - 모든 파일 생성/이동/삭제/링크는 sudo 사용.
+#   - rsync 비교·복사 시 _logs/** 및 잡파일을 제외하여 노이즈/재배포를 방지.
 #   - ln -sT + mv -Tf 조합으로 원자적 전환, 실패 시 rm → mv 폴백 처리.
+#   - NEW_DIR 자동 생성 실패 시(다운로드/무결성 에러/디스크 부족) 즉시 실패(fail-fast).
 # ───────────────────────────────────────────────────────────────────────────────
 .fn_tomcat_diff_deploy:
   script: |
@@ -1307,8 +1310,13 @@
       : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
       : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
       : "${REMOTE_DIR:?REMOTE_DIR is required}"
-      : "${CONTEXT_PATH:?CONTEXT_PATH is required}"            # 예: /devops
-      : "${DEPLOY_VERSION:?DEPLOY_VERSION is required}"        # 예: 1.4.1
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+      : "${NEXUS_USER:?NEXUS_USER is required}"
+      : "${NEXUS_PASS:?NEXUS_PASS is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
 
       # ── 선택 입력(기본값) ───────────────────────────
       remote_port="${REMOTE_DEPLOY_PORT:-22}"
@@ -1319,7 +1327,7 @@
       keep_releases="${KEEP_RELEASES:-15}"
 
       # 헬스체크
-      health_mode="${HEALTH_MODE:-page}"                       # actuator|page|none
+      health_mode="${HEALTH_MODE:-page}"           # actuator|page|none
       health_url_override="${HEALTH_URL_OVERRIDE:-}"
       hc_timeout="${HEALTHCHECK_TIMEOUT:-60}"
       hc_interval="${HEALTHCHECK_INTERVAL:-2}"
@@ -1330,8 +1338,10 @@
       deploy_pass="${DEPLOY_PASS:-}"
       was_url="${WAS_URL:-127.0.0.1:8080}"
 
-      # 로그/산출물
-      deploy_log_name="${DEPLOY_LOG_NAME:-diff-deploy.log}"
+      auto_fetch_on_missing="true"                 # NEW_DIR 없으면 Nexus에서 내려받아 생성
+
+      # GitLab 산출물 파일명(로컬 Runner 수집용)
+      deploy_log_name="deploy.log"                 # 산출물로 복사되는 이름
 
       # ── 유틸 ─────────────────────────────────────────
       log()  { printf '[INFO] %s\n' "$*"; }
@@ -1339,14 +1349,12 @@
       fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
       shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
 
-      # ── 원격 스크립트 생성 ───────────────────────────
       remote_script=$(mktemp /tmp/remote_diff_deploy.XXXXXX)
       log "Created temporary diff deploy script: $remote_script"
 
       cat > "$remote_script" <<'REMOTE_SH'
       set -eu
 
-      # ── 로컬 유틸 ─────────────────────────────────────
       log()  { printf '[INFO] %s\n' "$*"; }
       ok()   { printf '[OK]   %s\n' "$*"; }
       fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
@@ -1356,10 +1364,9 @@
       is_dir()  { sudo test -d "$1"; }
       is_any()  { sudo test -e "$1" -o -L "$1"; }
 
-      # ── 필수 env ─────────────────────────────────────
       : "${REMOTE_DIR:?}"
+      : "${COMMIT_TAG:?}"
       : "${CONTEXT_PATH:?}"
-      : "${DEPLOY_VERSION:?}"
       : "${WEBAPPS_ROOT:?}"
       : "${RELEASES_BASE:?}"
       : "${ARTIFACTS_BASE:?}"
@@ -1373,26 +1380,30 @@
       : "${DEPLOY_USER:-}"
       : "${DEPLOY_PASS:-}"
       : "${WAS_URL:?}"
-      : "${DEPLOY_LOG_NAME:?}"
+      : "${AUTO_FETCH_ON_MISSING:?}"
+
+      : "${NEXUS_USER:?}"
+      : "${NEXUS_PASS:?}"
+      : "${RELEASE_REPO_URL:?}"
+      : "${GROUP_ID:?}"
+      : "${ARTIFACT_ID:?}"
 
       APP_NAME="$(printf "%s" "${CONTEXT_PATH#/}")"
+      DEPLOY_VERSION="${COMMIT_TAG#v}"
+
       LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
       APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
       NEW_DIR="${ARTIFACTS_BASE%/}/${APP_NAME}/${APP_NAME}-${DEPLOY_VERSION}"
 
+      # 원격/산출물 경로
       ART_DIR="$REMOTE_DIR/artifacts"
-      LOG="$ART_DIR/$DEPLOY_LOG_NAME"
       OUT_ZIP="$ART_DIR/diff-deploy-artifacts.zip"
-      CHANGED_LIST="$ART_DIR/changed-files.txt"
-      DELETE_LIST="$ART_DIR/deleted-files.txt"
 
+      uid="$(id -u)"; gid="$(id -g)"
       sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
-      : > "$LOG"
-      : > "$CHANGED_LIST"
-      : > "$DELETE_LIST"
+      sudo chown -R "$uid:$gid" "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
 
-      # 도구 보장
-      for t in rsync ln readlink zip awk sed grep sort uniq curl; do
+      for t in rsync ln readlink zip awk sed grep sort uniq curl unzip mktemp df ls tee; do
         if ! need "$t"; then
           if   need apk; then sudo apk add --no-cache "$t" || true
           elif need apt-get; then sudo apt-get update -y && sudo apt-get install -y "$t" || true
@@ -1401,32 +1412,58 @@
         fi
       done
       need rsync || fail "rsync not available"
-      need ln || fail "ln not available"
-      need readlink || fail "readlink not available"
-      need zip || fail "zip not available"
 
-      [ -d "$NEW_DIR" ] || fail "NEW_DIR not found: $NEW_DIR"
+      # NEW_DIR 확보
+      if [ ! -d "$NEW_DIR" ]; then
+        if [ "$AUTO_FETCH_ON_MISSING" = "true" ]; then
+          log "NEW_DIR not found → auto-create from Nexus"
+          APP_PATH="${GROUP_ID//.//}/${ARTIFACT_ID}/${DEPLOY_VERSION}"
+          NEW_WAR="${ARTIFACT_ID}-${DEPLOY_VERSION}.war"
+          NEW_URL="${RELEASE_REPO_URL%/}/${APP_PATH}/${NEW_WAR}"
+          TMP_DIR=$(sudo mktemp -d /tmp/${APP_NAME}-${DEPLOY_VERSION}-fetch.XXXXXX)
+          sudo df -h / /tmp "$REMOTE_DIR" 2>/dev/null || true
 
-      # ── LIVE → BASE 계산 & 1회 레거시 시드 ─────────────
+          log "Downloading WAR: $NEW_URL"
+          if ! sudo curl -fSL --retry 3 --retry-connrefused --max-time 600 \
+                 -u "$NEXUS_USER:$NEXUS_PASS" \
+                 -o "$TMP_DIR/$NEW_WAR" "$NEW_URL"; then
+            sudo ls -l "$TMP_DIR" || true
+            fail "Failed to download WAR from Nexus: $NEW_URL"
+          fi
+
+          log "Unzipping WAR to $NEW_DIR"
+          sudo unzip -q "$TMP_DIR/$NEW_WAR" -d "$TMP_DIR/unzip"
+          sudo unzip -tq "$TMP_DIR/$NEW_WAR" >/dev/null 2>&1 || fail "WAR integrity test failed"
+          sudo test -d "$TMP_DIR/unzip/WEB-INF" || fail "Invalid WAR structure (no WEB-INF)"
+          sudo mkdir -p "$(dirname "$NEW_DIR")"
+          sudo rm -rf "$NEW_DIR"
+          sudo mv "$TMP_DIR/unzip" "$NEW_DIR"
+          sudo rm -rf "$TMP_DIR"
+          ok "NEW_DIR created from Nexus: $NEW_DIR"
+        else
+          fail "NEW_DIR not found and AUTO_FETCH_ON_MISSING=false: $NEW_DIR"
+        fi
+      else
+        log "Using existing NEW_DIR: $NEW_DIR"
+      fi
+
+      # LIVE 기준 확보/초기 마이그레이션
       prev_target=""
       if is_link "$LIVE_LINK"; then
         prev_target="$(sudo readlink -f "$LIVE_LINK" || true)"
       elif is_dir "$LIVE_LINK"; then
-        # 레거시: LIVE가 디렉터리. 시드 스냅샷 생성
         seed="${APP_RELEASES_DIR}/diff-legacy-backup-$(ts)"
         log "Seeding legacy snapshot from LIVE DIR -> $seed"
-        sudo rsync -a --delete "${LIVE_LINK%/}/" "${seed%/}/" | tee -a "$LOG" || true
+        sudo rsync -a --delete "${LIVE_LINK%/}/" "${seed%/}/" || true
         prev_target="$seed"
-        # 이후 LIVE를 심링크 체계로 통일
         tmp_link="${LIVE_LINK}.new.$(ts)"
         sudo ln -sT "$seed" "$tmp_link" 2>/dev/null || sudo ln -s "$seed" "$tmp_link"
         sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || { sudo rm -rf --one-file-system "$LIVE_LINK"; sudo mv "$tmp_link" "$LIVE_LINK"; }
       elif is_any "$LIVE_LINK"; then
-        # 파일/깨진링크 → 제거 후 시드
         seed="${APP_RELEASES_DIR}/diff-legacy-backup-$(ts)"
         log "Seeding legacy snapshot (non-dir LIVE) -> $seed"
         sudo rm -rf --one-file-system "$LIVE_LINK" || true
-        sudo rsync -a "${NEW_DIR%/}/" "${seed%/}/" | tee -a "$LOG" || true
+        sudo rsync -a "${NEW_DIR%/}/" "${seed%/}/" || true
         prev_target="$seed"
         tmp_link="${LIVE_LINK}.new.$(ts)"
         sudo ln -sT "$seed" "$tmp_link" 2>/dev/null || sudo ln -s "$seed" "$tmp_link"
@@ -1438,51 +1475,52 @@
         BASE_DIR="$(sudo readlink -f "$LIVE_LINK" || true)"
       fi
       [ -n "$BASE_DIR" ] || fail "Cannot resolve BASE_DIR from LIVE_LINK: $LIVE_LINK"
-      echo "BASE_DIR=$BASE_DIR" | tee -a "$LOG"
       [ -n "$prev_target" ] || prev_target="$BASE_DIR"
 
-      # ── TARGET 준비(이전 스냅샷 복제) ──────────────────
+      # TARGET 준비
       stamp="$(ts)"
       TARGET="${APP_RELEASES_DIR}/diff-${APP_NAME}-${DEPLOY_VERSION}-${stamp}"
       log "Prepare TARGET: $TARGET"
       sudo mkdir -p "$TARGET"
-      # 이전 스냅샷을 복제해서 시작 (삭제 포함 동기화)
-      sudo rsync -a --delete "${prev_target%/}/" "${TARGET%/}/" | tee -a "$LOG" || true
+      sudo rsync -a --delete "${prev_target%/}/" "${TARGET%/}/" || true
 
-      # ── 변경 비교 (NEW vs BASE) ──────────────────────
-      # rsync dry-run (디렉터리 제외, 삭제는 '*deleting ' 패턴)
+      # TARGET/_logs
+      LOG_DIR="${TARGET%/}/_logs"
+      sudo mkdir -p "$LOG_DIR"
+      sudo chown -R "$uid:$gid" "$LOG_DIR"
+
+      DIFF_BASE_FILE="$LOG_DIR/diff-base.env"        # (구 deploy.log)
+      LIVE_POINTER_FILE="$LOG_DIR/live-pointer.env"  # (구 rollback.log)
+      CHANGED_LIST="$LOG_DIR/changed-files.txt"
+      DELETE_LIST="$LOG_DIR/deleted-files.txt"
+      : > "$CHANGED_LIST"; : > "$DELETE_LIST"
+      printf 'BASE_DIR=%s\n' "$BASE_DIR" > "$DIFF_BASE_FILE"
+
+      # 변경/삭제 목록(dry-run) - _logs & 잡파일 제외
       log "Rsync dry-run NEW vs BASE to compute changes"
-      mapfile -t lines < <(rsync -ai --delete --dry-run --out-format='%i %n' "${NEW_DIR%/}/" "${BASE_DIR%/}/")
+      mapfile -t lines < <(sudo rsync -ai --delete --dry-run --out-format='%i %n' \
+        --exclude='_logs/**' \
+        --exclude='*.bad' --exclude='*.tmp' --exclude='*.bak' --exclude='*.swp' --exclude='*.log' \
+        "${NEW_DIR%/}/" "${BASE_DIR%/}/")
       for ln in "${lines[@]}"; do
-        # 삭제 항목
         if printf '%s\n' "$ln" | grep -q '^\*deleting '; then
           f="${ln#*deleting }"
-          # 디렉터리 삭제는 나중에 정리
           echo "$f" >> "$DELETE_LIST"
           continue
         fi
-        # 변경/추가 식별: 첫 칼럼의 퍼미션/플래그(>f, .d, >d 등)
         if printf '%s\n' "$ln" | grep -qE '^(>f|\.*f\+|\>d)'; then
-          # 경로만 추출
           f="$(printf '%s' "$ln" | sed 's/^[^ ]\+ //')"
-          # 디렉터리 항목은 건너뜀(파일만 수집)
           [[ "$f" == */ ]] && continue
           echo "$f" >> "$CHANGED_LIST"
         fi
       done
-
-      # 중복 제거/정렬
-      if [ -s "$CHANGED_LIST" ]; then
-        sort -u "$CHANGED_LIST" -o "$CHANGED_LIST"
-      fi
-      if [ -s "$DELETE_LIST" ]; then
-        sort -u "$DELETE_LIST" -o "$DELETE_LIST"
-      fi
+      [ -s "$CHANGED_LIST" ] && sort -u "$CHANGED_LIST" -o "$CHANGED_LIST" || true
+      [ -s "$DELETE_LIST" ] && sort -u "$DELETE_LIST" -o "$DELETE_LIST" || true
 
       log "Changed files: $(wc -l < "$CHANGED_LIST" || echo 0)"
       log "Deleted files: $(wc -l < "$DELETE_LIST" || echo 0)"
 
-      # ── 삭제 반영 (TARGET에서 삭제) ───────────────────
+      # 삭제 반영
       if [ -s "$DELETE_LIST" ]; then
         while IFS= read -r rel; do
           [ -z "$rel" ] && continue
@@ -1490,36 +1528,37 @@
         done < "$DELETE_LIST"
       fi
 
-      # ── 실제 차분 반영 (NEW -> TARGET) ────────────────
+      # 변경/추가 반영
+      changed=0
       if [ -s "$CHANGED_LIST" ]; then
-        # rsync --files-from 은 상대경로 기준 원본/대상 루트 지정 필요
-        sudo rsync -a --files-from="$CHANGED_LIST" "${NEW_DIR%/}/" "${TARGET%/}/" | tee -a "$LOG" || true
+        sudo rsync -a --files-from="$CHANGED_LIST" "${NEW_DIR%/}/" "${TARGET%/}/" || true
         changed=1
-      else
-        changed=0
       fi
 
-      # ── LIVE 전환 (원자적 교체) ───────────────────────
+      # LIVE 전환
       tmp_link="${LIVE_LINK}.new.$(ts)"
       sudo ln -sT "$TARGET" "$tmp_link" 2>/dev/null || sudo ln -s "$TARGET" "$tmp_link"
       sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || { sudo rm -rf --one-file-system "$LIVE_LINK"; sudo mv "$tmp_link" "$LIVE_LINK"; }
       log "LIVE -> $TARGET"
 
-      # ── Tomcat 적용 ───────────────────────────────────
+      # LIVE 포인터 기록 (CURRENT, PREV)
+      printf 'CURRENT=%s\n' "$TARGET" > "$LIVE_POINTER_FILE"
+      printf 'PREV=%s\n' "$BASE_DIR" >> "$LIVE_POINTER_FILE"
+
+      # Tomcat 적용
       if [ "$HOT_RELOAD" = "true" ] && [ -n "$DEPLOY_USER" ] && [ -n "$DEPLOY_PASS" ] && need curl; then
-        curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" >>"$LOG" 2>&1 || true
+        sudo curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" >/dev/null 2>&1 || true
       else
         if need systemctl; then
           if sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null; then
-            log "Tomcat reload ok"
+            :
           else
-            log "Reload unsupported → restart"
             sudo systemctl restart "$TOMCAT_SERVICE"
           fi
         fi
       fi
 
-      # ── 헬스체크 ──────────────────────────────────────
+      # 헬스체크
       hc_url=""
       if [ -n "$HEALTH_URL_OVERRIDE" ]; then
         hc_url="$HEALTH_URL_OVERRIDE"
@@ -1531,23 +1570,18 @@
           *)        hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
         esac
       fi
-
       if [ -n "$hc_url" ] && need curl; then
-        log "Health wait: $hc_url (timeout=${HC_TIMEOUT}s)"
-        elapsed=0
-        ok_flag=0
+        elapsed=0; ok_flag=0
         while [ "$elapsed" -lt "$HC_TIMEOUT" ]; do
-          if curl -fsS --max-time 3 "$hc_url" >/dev/null 2>&1; then ok_flag=1; break; fi
+          if sudo curl -fsS --max-time 3 "$hc_url" >/dev/null 2>&1; then ok_flag=1; break; fi
           sleep "$HC_INTERVAL"; elapsed=$((elapsed+HC_INTERVAL))
         done
         [ "$ok_flag" = 1 ] || fail "Health check failed: $hc_url"
-      else
-        log "Health check skipped"
       fi
 
-      # ── 보관정책 ──────────────────────────────────────
+      # 보관정책
       if need ls; then
-        mapfile -t snaps < <(ls -1dt "${APP_RELEASES_DIR}/diff-${APP_NAME}-"* 2>/dev/null || true)
+        mapfile -t snaps < <(sudo ls -1dt "${APP_RELEASES_DIR}/diff-${APP_NAME}-"* 2>/dev/null || true)
         if [ "${#snaps[@]}" -gt "$KEEP_RELEASES" ]; then
           for ((i=KEEP_RELEASES; i<${#snaps[@]}; i++)); do
             [ "${snaps[$i]}" = "$TARGET" ] && continue
@@ -1556,27 +1590,32 @@
         fi
       fi
 
-      # ── 산출물 ────────────────────────────────────────
+      # 산출물(zip) 구성: TARGET/_logs → ART_DIR 복사
+      sudo cp -f "$DIFF_BASE_FILE" "$ART_DIR/diff-base.env" || true
+      sudo cp -f "$LIVE_POINTER_FILE" "$ART_DIR/live-pointer.env" || true
+      sudo cp -f "$CHANGED_LIST" "$ART_DIR/changed-files.txt" || true
+      sudo cp -f "$DELETE_LIST" "$ART_DIR/deleted-files.txt" || true
+      sudo chown "$uid:$gid" "$ART_DIR"/* 2>/dev/null || true
+
       {
         echo "DEPLOYED_VERSION=$DEPLOY_VERSION"
         echo "LIVE_LINK=$LIVE_LINK"
         echo "TARGET=$TARGET"
         echo "BASE_DIR=$BASE_DIR"
         echo "CHANGED=$changed"
+        echo "LOG_DIR=$LOG_DIR"
       } > "$ART_DIR/.env"
 
-      sudo rm -f "$OUT_ZIP"
-      ( cd "$ART_DIR" && zip -r "$(basename "$OUT_ZIP")" "$(basename "$LOG")" ".env" "changed-files.txt" "deleted-files.txt" >/dev/null 2>&1 || true )
+      ( cd "$ART_DIR" && zip -r "$(basename "$OUT_ZIP")" ".env" "diff-base.env" "live-pointer.env" "changed-files.txt" "deleted-files.txt" >/dev/null 2>&1 || true )
       ok "Diff deploy completed"
       echo "$OUT_ZIP"
     REMOTE_SH
 
-      # ── 원격 실행 ─────────────────────────────────────
       log "▶ Executing diff deploy via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
       ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
         "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "COMMIT_TAG='$(shq "$COMMIT_TAG")'" \
         "CONTEXT_PATH='$(shq "$CONTEXT_PATH")'" \
-        "DEPLOY_VERSION='$(shq "$DEPLOY_VERSION")'" \
         "WEBAPPS_ROOT='$(shq "$webapps_root")'" \
         "RELEASES_BASE='$(shq "$releases_base")'" \
         "ARTIFACTS_BASE='$(shq "$artifacts_base")'" \
@@ -1590,11 +1629,15 @@
         "DEPLOY_USER='$(shq "$deploy_user")'" \
         "DEPLOY_PASS='$(shq "$deploy_pass")'" \
         "WAS_URL='$(shq "$was_url")'" \
-        "DEPLOY_LOG_NAME='$(shq "$deploy_log_name")'" \
-        'export REMOTE_DIR CONTEXT_PATH DEPLOY_VERSION WEBAPPS_ROOT RELEASES_BASE ARTIFACTS_BASE TOMCAT_SERVICE KEEP_RELEASES HEALTH_MODE HEALTH_URL_OVERRIDE HC_TIMEOUT HC_INTERVAL HOT_RELOAD DEPLOY_USER DEPLOY_PASS WAS_URL DEPLOY_LOG_NAME; bash -s' \
+        "AUTO_FETCH_ON_MISSING='$(shq "$auto_fetch_on_missing")'" \
+        "NEXUS_USER='$(shq "$NEXUS_USER")'" \
+        "NEXUS_PASS='$(shq "$NEXUS_PASS")'" \
+        "RELEASE_REPO_URL='$(shq "$RELEASE_REPO_URL")'" \
+        "GROUP_ID='$(shq "$GROUP_ID")'" \
+        "ARTIFACT_ID='$(shq "$ARTIFACT_ID")'" \
+        'export REMOTE_DIR COMMIT_TAG CONTEXT_PATH WEBAPPS_ROOT RELEASES_BASE ARTIFACTS_BASE TOMCAT_SERVICE KEEP_RELEASES HEALTH_MODE HEALTH_URL_OVERRIDE HC_TIMEOUT HC_INTERVAL HOT_RELOAD DEPLOY_USER DEPLOY_PASS WAS_URL AUTO_FETCH_ON_MISSING NEXUS_USER NEXUS_PASS RELEASE_REPO_URL GROUP_ID ARTIFACT_ID; bash -s' \
         < "$remote_script" | tee /tmp/_diff_deploy_out.txt
 
-      # ── 산출물 회수 ───────────────────────────────────
       remote_zip_path="$(tail -n1 /tmp/_diff_deploy_out.txt || true)"
       [ -z "$remote_zip_path" ] && remote_zip_path="${REMOTE_DIR}/artifacts/diff-deploy-artifacts.zip"
       local_dir="${CI_PROJECT_DIR:-.}/artifacts"
@@ -1604,7 +1647,6 @@
       rm -f "$remote_script" /tmp/_diff_deploy_out.txt || true
       ok "Diff deploy finished"
     }
-
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 함수: fn_tomcat_diff_restore
@@ -1624,10 +1666,12 @@
 #   3) 대상 선택 우선순위:
 #      - ROLLBACK_TO_NAME(정확한 디렉터리명) >
 #        ROLLBACK_TO_VERSION(버전 일치) >
+#        현재 타깃의 _logs/diff-base.env 의 BASE_DIR 값(직전 운영) >
 #        “현재보다 한 단계 이전”(없으면 최신/유일 후보)
 #      - 자기 자신(current)으로 선택되는 경우는 다음 적합 후보로 대체
 #   4) LIVE 전환(원자적):
 #      - ln -sT target <tmp link> → mv -Tf 로 LIVE_LINK 교체(폴백 처리 포함)
+#      - 대상 스냅샷의 _logs/live-pointer.env 에 CURRENT=target, PREV=<이전 current> 기록
 #   5) Tomcat 적용:
 #      - HOT_RELOAD=true & DEPLOY_USER/PASS 있으면 manager reload 호출
 #      - 아니면 systemctl reload 실패 시 restart
@@ -1635,15 +1679,16 @@
 #      - HEALTH_URL_OVERRIDE 우선, 없으면 mode에 따라 기본 URL 구성
 #      - 실패 시 fail
 #   7) 마커 처리:
-#      - 성공 롤백 후, 직전 current 디렉터리에 .bad 마커를 기록(옵션)
+#      - 성공 롤백 후, 이전 current 디렉터리에 .bad 마커를 기록(옵션)
 #   8) 산출물 zip 반환:
 #      - 원격: $REMOTE_DIR/artifacts/diff-restore-artifacts.zip
 #
-# 주요 경로(코드 상수/기본값):
+# 주요 경로(코드 기본값):
 #   WEBAPPS_ROOT  : /opt/tomcat/webapps
 #   RELEASES_BASE : /opt/tomcat/releases
 #   LIVE_LINK     : <WEBAPPS_ROOT>/<app>
 #   SNAPSHOTS     : <RELEASES_BASE>/<app>/diff-<app>-*
+#   LOGS PER SNAP : <SNAPSHOT>/_logs/{diff-base.env, live-pointer.env, ...}
 #   BAD_MARKER    : .bad (변수 BAD_MARKER_NAME)
 #
 # 산출물(원격에 생성):
@@ -1651,8 +1696,10 @@
 #     ├── diff-restore-artifacts.zip
 #     ├── diff-restore.log             (RESTORE_LOG_NAME, 기본 diff-restore.log)
 #     └── .env
+#         - ROLLED_BACK_FROM=<이전 current>
 #         - ROLLED_BACK_TO=<target dir>
 #         - LIVE_LINK=<LIVE_LINK>
+#         - RESOLVED_BY=override:name|override:version|diff-base.env|list:*
 #
 # 필수 환경변수(외부 래퍼/CI에서 주입):
 #   REMOTE_DEPLOY_HOST, REMOTE_DEPLOY_USER, REMOTE_DIR, CONTEXT_PATH
@@ -1698,35 +1745,28 @@
       tomcat_service="${TOMCAT_SERVICE:-tomcat}"
       was_url="${WAS_URL:-127.0.0.1:8080}"
 
-      # 롤백 대상 지정(둘 중 하나 또는 모두 비워도 됨)
       rollback_to_name="${ROLLBACK_TO_NAME:-}"           # 예: diff-devops-1.4.0-20251019101822
       rollback_to_version="${ROLLBACK_TO_VERSION:-}"     # 예: 1.4.0
 
-      # BAD 마커 정책
       mark_bad_on_rollback="${MARK_BAD_ON_ROLLBACK:-true}"
       bad_marker_name="${BAD_MARKER_NAME:-.bad}"
 
-      # 헬스체크
       health_mode="${HEALTH_MODE:-page}"
       health_url_override="${HEALTH_URL_OVERRIDE:-}"
       hc_timeout="${HEALTHCHECK_TIMEOUT:-60}"
       hc_interval="${HEALTHCHECK_INTERVAL:-2}"
 
-      # Tomcat manager(핫리로드)
       hot_reload="${HOT_RELOAD:-false}"
       deploy_user="${DEPLOY_USER:-}"
       deploy_pass="${DEPLOY_PASS:-}"
 
-      # 로그/산출물
       restore_log_name="${RESTORE_LOG_NAME:-diff-restore.log}"
 
-      # ── 유틸 ──────────────────────────────────────────
       log()  { printf '[INFO] %s\n' "$*"; }
       ok()   { printf '[OK]   %s\n' "$*"; }
       fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
       shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
 
-      # ── 원격 스크립트 생성 ───────────────────────────
       remote_script=$(mktemp /tmp/remote_diff_restore.XXXXXX)
       log "Created temporary diff restore script: $remote_script"
 
@@ -1741,7 +1781,6 @@
       is_link() { sudo test -L "$1"; }
       is_dir()  { sudo test -d "$1"; }
 
-      # ── 필수 env ─────────────────────────────────────
       : "${REMOTE_DIR:?}"
       : "${CONTEXT_PATH:?}"
       : "${WEBAPPS_ROOT:?}"
@@ -1781,13 +1820,14 @@
         fi
       done
 
+      # 현재 LIVE 대상
       current=""
       if is_link "$LIVE_LINK"; then
         current="$(sudo readlink -f "$LIVE_LINK" || true)"
       fi
       echo "CURRENT=$current" | tee -a "$LOG"
 
-      # 후보 수집(최신순), .bad 있는 항목은 제외
+      # 후보 수집(최신순) + BAD 제외
       mapfile -t rels < <(
         ls -1dt "${APP_RELEASES_DIR}/diff-${APP_NAME}-"* 2>/dev/null \
         | while read -r d; do
@@ -1797,44 +1837,65 @@
             printf "%s\n" "$d"
           done
       )
-      [ "${#rels[@]}" -ge 1 ] || fail "no diff snapshots found"
 
-      # 대상 선택 우선순위: ROLLBACK_TO_NAME > ROLLBACK_TO_VERSION > '현재의 한 단계 이전'
-      target=""
-      if [ -n "$ROLLBACK_TO_NAME" ]; then
+      target=""; resolved_by=""
+
+      # 1) 이름 우선
+      if [ -z "$target" ] && [ -n "$ROLLBACK_TO_NAME" ]; then
         cand="${APP_RELEASES_DIR}/${ROLLBACK_TO_NAME}"
         [ -d "$cand" ] || fail "rollback target not found: $cand"
-        target="$cand"
-      elif [ -n "$ROLLBACK_TO_VERSION" ]; then
+        target="$cand"; resolved_by="override:name"
+      fi
+
+      # 2) 버전 우선
+      if [ -z "$target" ] && [ -n "$ROLLBACK_TO_VERSION" ]; then
+        [ "${#rels[@]}" -ge 1 ] || fail "no diff snapshots found"
         for d in "${rels[@]}"; do
-          base="$(basename "$d")" # diff-<app>-<ver>-<ts>
+          base="$(basename "$d")"
           ver="$(printf "%s" "$base" | sed -E "s/^diff-${APP_NAME}-([^-]+)-.*/\1/")"
-          if [ "$ver" = "$ROLLBACK_TO_VERSION" ]; then target="$d"; break; fi
+          if [ "$ver" = "$ROLLBACK_TO_VERSION" ]; then target="$d"; resolved_by="override:version"; break; fi
         done
         [ -n "$target" ] || fail "no snapshot found for version: $ROLLBACK_TO_VERSION"
-      else
-        # '현재보다 한 단계 이전' 로직
+      fi
+
+      # 3) 현재 타깃의 _logs/diff-base.env → BASE_DIR
+      if [ -z "$target" ] && [ -n "$current" ] && [ -d "$current" ]; then
+        dbase="$current/_logs/diff-base.env"
+        lp="$current/_logs/live-pointer.env"
+        if sudo test -f "$lp"; then
+          cur_in_log="$(sudo awk -F= '/^CURRENT=/{print $2}' "$lp" 2>/dev/null || true)"
+          echo "CHECK live-pointer CURRENT=$cur_in_log" | tee -a "$LOG"
+        fi
+        if sudo test -f "$dbase"; then
+          base_dir="$(sudo awk -F= '/^BASE_DIR=/{print $2}' "$dbase" 2>/dev/null || true)"
+          if [ -n "$base_dir" ] && [ -d "$base_dir" ]; then
+            target="$base_dir"; resolved_by="diff-base.env"
+          fi
+        fi
+      fi
+
+      # 4) 목록 기반 폴백(현재의 한 칸 이전)
+      if [ -z "$target" ]; then
+        [ "${#rels[@]}" -ge 1 ] || fail "no diff snapshots found"
         if [ -n "$current" ]; then
-          # rels 에서 current 다음 것을 고른다
-          found=0
+          found=0; idx=0
           for ((i=0; i<${#rels[@]}; i++)); do
             [ "$(sudo readlink -f "${rels[$i]}")" = "$current" ] && { found=1; idx=$i; break; }
           done
           if [ "$found" = 1 ] && [ $((idx+1)) -lt ${#rels[@]} ]; then
-            target="${rels[$((idx+1))]}"
+            target="${rels[$((idx+1))]}"; resolved_by="list:prev-of-current"
           else
-            # current 가 목록에 없거나, 맨 마지막이면 최신에서 두 번째 또는 첫 번째
-            if [ "${#rels[@]}" -ge 2 ]; then target="${rels[1]}"; else target="${rels[0]}"; fi
+            if [ "${#rels[@]}" -ge 2 ]; then target="${rels[1]}"; resolved_by="list:second-latest"; else target="${rels[0]}"; resolved_by="list:latest"; fi
           fi
         else
-          if [ "${#rels[@]}" -ge 2 ]; then target="${rels[1]}"; else target="${rels[0]}"; fi
+          if [ "${#rels[@]}" -ge 2 ]; then target="${rels[1]}"; resolved_by="list:second-latest"; else target="${rels[0]}"; resolved_by="list:latest"; fi
         fi
       fi
 
       [ -n "$target" ] && [ -d "$target" ] || fail "rollback target invalid"
-      echo "TARGET=$target" | tee -a "$LOG"
+      echo "TARGET=$target (resolved_by=$resolved_by)" | tee -a "$LOG"
 
-      # LIVE 전환(원자적)
+      # LIVE 전환
       tmp_link="${LIVE_LINK}.new.$(ts)"
       sudo ln -sT "$target" "$tmp_link" 2>/dev/null || sudo ln -s "$target" "$tmp_link"
       sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || { sudo rm -rf --one-file-system "$LIVE_LINK"; sudo mv "$tmp_link" "$LIVE_LINK"; }
@@ -1846,9 +1907,8 @@
       else
         if need systemctl; then
           if sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null; then
-            log "Tomcat reload ok"
+            :
           else
-            log "Reload unsupported → restart"
             sudo systemctl restart "$TOMCAT_SERVICE"
           fi
         fi
@@ -1873,19 +1933,23 @@
           sleep "$HC_INTERVAL"; elapsed=$((elapsed+HC_INTERVAL))
         done
         [ "$ok_flag" = 1 ] || fail "rollback health failed: $hc_url"
-      else
-        log "Health check skipped"
       fi
 
-      # 현재를 BAD 마크(성공 롤백 후)
+      # BAD 마킹(성공 롤백 후 이전 current에)
       if [ -n "$current" ] && [ -d "$current" ] && [ "$MARK_BAD_ON_ROLLBACK" = "true" ]; then
         sudo sh -c "printf 'marked bad on %s\n' \"$(date -Ins)\" > '$current/$BAD_MARKER_NAME'"
       fi
 
-      # 산출물
+      # 대상 스냅샷의 live-pointer.env 갱신 (CURRENT, PREV)
+      if [ -d "$target/_logs" ]; then
+        sudo sh -c "printf 'CURRENT=%s\nPREV=%s\n' '$target' '${current:-}' > '$target/_logs/live-pointer.env'" || true
+      fi
+
       {
+        echo "ROLLED_BACK_FROM=${current:-}"
         echo "ROLLED_BACK_TO=$target"
         echo "LIVE_LINK=$LIVE_LINK"
+        echo "RESOLVED_BY=$resolved_by"
       } > "$ART_DIR/.env"
 
       sudo rm -f "$OUT_ZIP"
@@ -1894,7 +1958,6 @@
       echo "$OUT_ZIP"
     REMOTE_SH
 
-      # ── 원격 실행 ─────────────────────────────────────
       log "▶ Executing diff restore via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
       ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
         "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
@@ -1918,7 +1981,6 @@
         'export REMOTE_DIR CONTEXT_PATH WEBAPPS_ROOT RELEASES_BASE TOMCAT_SERVICE WAS_URL ROLLBACK_TO_NAME ROLLBACK_TO_VERSION HEALTH_MODE HEALTH_URL_OVERRIDE HC_TIMEOUT HC_INTERVAL HOT_RELOAD DEPLOY_USER DEPLOY_PASS RESTORE_LOG_NAME MARK_BAD_ON_ROLLBACK BAD_MARKER_NAME; bash -s' \
         < "$remote_script" | tee /tmp/_diff_restore_out.txt
 
-      # ── 산출물 회수 ───────────────────────────────────
       remote_zip_path="$(tail -n1 /tmp/_diff_restore_out.txt || true)"
       [ -z "$remote_zip_path" ] && remote_zip_path="${REMOTE_DIR}/artifacts/diff-restore-artifacts.zip"
       local_dir="${CI_PROJECT_DIR:-.}/artifacts"
@@ -1928,7 +1990,6 @@
       rm -f "$remote_script" /tmp/_diff_restore_out.txt || true
       ok "Diff restore finished"
     }
-
 
 # ────────────────────────────────────────────────
 # 함수: fn_tomcat_symbolic_deploy
