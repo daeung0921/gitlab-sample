@@ -37,26 +37,27 @@ variables:
   TOMCAT_SERVICE: "tomcat"                       # systemd 서비스명 (tomcat|tomcat9 등)
   TOMCAT_WEBAPPS_DIR: "/opt/tomcat/webapps"      # LIVE 심링크 위치 (webapps/<APP>)
   RELEASES_BASE: "/opt/tomcat/releases"          # 릴리스 저장 루트
-  KEEP_RELEASES: "5"                             # 보관할 최신 릴리스 개수
-
-  # ─── Tomcat Manager (Optional) ────────────────────────────────────────────
-  HOT_RELOAD: "false"                            # true면 manager/text reload 시도
+  TOMCAT_ARTIFACTS_DIR: "/opt/tomcat/artifacts"  # 아티팩트 저장 위치 (diff only)
+ 
+  # ─── Deployment ───────────────────────────────────────────
   DEPLOY_USER: ""                                # manager-script 권한 유저
   DEPLOY_PASS: ""                                # manager-script 비밀번호
-  WAS_URL: ""                                   # was manager 호출/페이지 헬스체크용 HOST:PORT 
-
-  # ─── Health Check Policy ─────────────────────────────────────────────────
+  WAS_URL: ""                                    # was manager 호출/페이지 헬스체크용 HOST:PORT   
+  KEEP_RELEASES: "5"                             # 보관할 최신 릴리스 개수
+  DEPLOY_VERSION: "${CI_COMMIT_TAG#v}"           # v1.4.1 → 1.4.1 로 변환 
+  DEPLOY_LOG_NAME: "deploy.log"                  # 배포 로그 파일명
+  RESTORE_LOG_NAME: "rollback.log"               # 롤백 로그 파일명
+  HOT_RELOAD: "false"                            # true면 manager/text reload 시도
+ 
   HEALTH_MODE: "actuator"                        # actuator | page | none
   HEALTH_URL_OVERRIDE: ""                        # 지정 시 최우선 URL
   HEALTHCHECK_TIMEOUT: "90"                      # 최대 대기(초)
   HEALTHCHECK_INTERVAL: "2"                      # 재시도 간격(초)
-
-  # ─── Logging / Artifacts ─────────────────────────────────────────────────
-  DEPLOY_LOG_NAME: "symlink-deploy.log"            # 배포 로그 파일명
-  RESTORE_LOG_NAME: "symlink-rollback.log"       # 롤백 로그 파일명
-
-  # ─── Rollback Options (Symlink) ──────────────────────────────────────────
-  ROLLBACK_TO_VERSION: ""                        # 지정 시 해당 버전으로 롤백, 미지정 시 자동 이전 선택
+ 
+  ROLLBACK_TO_VERSION: ""                         # 지정 시 해당 버전으로 롤백, 미지정 시 자동 이전 선택
+  ROLLBACK_TO_NAME: ""                            # 지정 시 해당 릴리즈로 롤백 (diff only)
+  MARK_BAD_ON_ROLLBACK: "true"                    # 롤백 성공 후 기존 current에 BAD 마커 생성
+  BAD_MARKER_NAME: ".bad"                         # 제외/표시용 마커 파일명
 
   # ─── JIRA 통합 옵션 ──────────────────────────────────────────────────────
   JIRA_SERVER: "https://company00.jira.mousoft.co.kr"
@@ -67,22 +68,6 @@ variables:
   JIRA_CURL_SILENT: "true"                       # true면 -s 사용
   JIRA_CURL_RETRY: "2"                           # 재시도 횟수
   JIRA_CURL_RETRY_DELAY: "2"                     # 재시도 간격(초)
-
-  # ─── LEGACY: Diff/Partial Deploy 옵션 (호환 주석용) ─────────────────────
-  # ※ 현재 표준은 “심링크 전환 배포”입니다. 아래 변수들은 과거 diff/rsync 기반 호환용입니다.
-  DIFF_USE_RSYNC: "true"                         # (미사용) true=rsync, false=scp
-  DIFF_HOT_RELOAD: "false"                       # (미사용) 환경에 따라 미지원
-  #DEPLOY_LOG_NAME: "diff-deploy.log"            # (미사용) 이전 로깅 파일명
-
-  # ─── LEGACY: Diff/Partial Deploy Backup 정책 (호환 주석용) ───────────── 
-  DIFF_BACKUP_DIR: "/var/backups/tomcat"         # LIVE 백업 루트
-  DIFF_BACKUP_PREFIX: "diff-backup"              # 백업 접두어
-  DIFF_BACKUP_RETENTION: "5"                     # (배포 시 회전이 필요하면 사용)
-  DIFF_BACKUP_BEFORE: "true"                     # 배포 전 스냅샷 여부
-  RESTORE_BACKUP_FILE: ""                        # 특정 tar.gz 지정 시 해당 버전 복원
-  RESTORE_LOG_NAME: "diff-rollback.log"
-  RESTORE_FALLBACK_PREV: "true"                  # 헬스 실패 시 이전 백업 자동 재시도
-
 
 # ────────────────────────────────────────────────
 # 공통 캐시 전략

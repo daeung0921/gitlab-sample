@@ -52,6 +52,8 @@
   variables:
     GIT_STRATEGY: none
     GIT_CHECKOUT: "false"
+    ROLLBACK_TO_VERSION: ""  
+    HEALTH_MODE: "none"      
   #needs:
   #  - job: approve_rollback
   #    artifacts: true

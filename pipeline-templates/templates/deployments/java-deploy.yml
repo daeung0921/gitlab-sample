@@ -46,6 +46,8 @@
   variables:
     GIT_STRATEGY: none
     GIT_CHECKOUT: "false"
+    HEALTH_MODE: "none"  
+    HOT_RELOAD: "false"    
   environment:
     name: production
     url: "http://$WAS_URL$CONTEXT_PATH/"
