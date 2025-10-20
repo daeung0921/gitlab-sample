@@ -1892,7 +1892,7 @@
       ( cd "$ART_DIR" && zip -r "$(basename "$OUT_ZIP")" "$(basename "$LOG")" ".env" >/dev/null 2>&1 || true )
       ok "Diff restore completed"
       echo "$OUT_ZIP"
-      REMOTE_SH
+    REMOTE_SH
 
       # ── 원격 실행 ─────────────────────────────────────
       log "▶ Executing diff restore via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
