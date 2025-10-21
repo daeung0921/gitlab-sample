@@ -44,12 +44,11 @@ variables:
   DEPLOY_PASS: ""                                # manager-script 비밀번호
   WAS_URL: ""                                    # was manager 호출/페이지 헬스체크용 HOST:PORT   
   KEEP_RELEASES: "5"                             # 보관할 최신 릴리스 개수
-  DEPLOY_VERSION: "${CI_COMMIT_TAG#v}"           # v1.4.1 → 1.4.1 로 변환 
   DEPLOY_LOG_NAME: "deploy.log"                  # 배포 로그 파일명
   RESTORE_LOG_NAME: "rollback.log"               # 롤백 로그 파일명
   HOT_RELOAD: "false"                            # true면 manager/text reload 시도
  
-  HEALTH_MODE: "actuator"                        # actuator | page | none
+  HEALTH_MODE: "none"                        # actuator | page | none
   HEALTH_URL_OVERRIDE: ""                        # 지정 시 최우선 URL
   HEALTHCHECK_TIMEOUT: "90"                      # 최대 대기(초)
   HEALTHCHECK_INTERVAL: "2"                      # 재시도 간격(초)

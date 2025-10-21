@@ -1216,49 +1216,37 @@
 # 함수: fn_tomcat_diff_deploy
 #
 # 목적:
-#   - Tomcat 운영 서버에 “실운영 디렉터리 스냅샷(diff)” 방식을 이용해 증분 배포를 수행한다.
-#   - NEW 버전(WAR unzip 결과)과 현재 운영(BASE_DIR)을 비교하여 변경/삭제만 반영하고,
-#     새 스냅샷(TARGET)을 만든 뒤 LIVE 심링크를 원자적으로 전환한다.
+#   - 기존 LIVE 심볼릭 링크를 기준으로 이전 버전 디렉터리를 식별하고,
+#     새 버전(WAR 기반)을 비교(diff)하여 변경/삭제된 파일만 증분 반영.
+#   - Tomcat 서비스의 무중단(or 최소중단) 배포를 수행.
+#   - 배포 후 헬스체크(healthcheck) 및 이전 릴리스 보존 정책 적용.
 #
-# 작동 개요(코드 기준):
-#   1) 버전/경로 결의
-#      - DEPLOY_VERSION = ${COMMIT_TAG#v} (v 접두 제거)
-#      - APP_NAME = ${CONTEXT_PATH#/}
-#      - LIVE_LINK = <WEBAPPS_ROOT>/<app>
-#      - APP_RELEASES_DIR = <RELEASES_BASE>/<app>
-#      - NEW_DIR = <ARTIFACTS_BASE>/<app>/<app>-<DEPLOY_VERSION>
-#   2) NEW_DIR 확보(정책상 자동 생성)
-#      - 디렉터리가 없으면 Nexus(RELEASE_REPO_URL/GROUP_ID/ARTIFACT_ID/DEPLOY_VERSION)에서
-#        WAR를 curl -u로 다운로드 → unzip → NEW_DIR 생성(무결성/구조 검사 포함)
-#   3) 기준 확보/레거시 교정(최초 1회)
-#      - LIVE_LINK가 디렉터리/파일이면 releases/<app>/diff-legacy-backup-<ts>로 seed 후
-#        LIVE_LINK를 해당 seed로 심링크 전환하여 “심링크 체계”로 통일
-#      - BASE_DIR = readlink -f(LIVE_LINK)
-#   4) TARGET 스냅샷 생성
-#      - TARGET = <RELEASES_BASE>/<app>/diff-<app>-<DEPLOY_VERSION>-<ts>
-#      - rsync -a --delete 로 prev_target 스냅샷을 복제하여 초기화
-#   5) 변경/삭제 목록 산출(rsync --dry-run)
-#      - rsync -ai --delete --dry-run --out-format='%i %n'
-#      - _logs/**, *.bad/*.tmp/*.bak/*.swp/*.log 등은 제외
-#      - 결과를 TARGET/_logs/changed-files.txt, deleted-files.txt 에 기록
-#      - 또한 TARGET/_logs/diff-base.env 에 BASE_DIR(직전 운영)을 기록
-#   6) 실제 반영
-#      - 삭제: deleted-files.txt를 기준으로 TARGET에서 제거
-#      - 변경/추가: --files-from=changed-files.txt 로 NEW_DIR → TARGET 동기화
-#   7) LIVE 전환(원자적)
-#      - ln -sT TARGET <tmp> → mv -Tf 로 LIVE_LINK 교체(실패 시 rm → mv 폴백)
-#      - TARGET/_logs/live-pointer.env 에 CURRENT=TARGET, PREV=BASE_DIR 기록
-#   8) Tomcat 반영
-#      - HOT_RELOAD=true & DEPLOY_USER/PASS 있으면 manager/text reload 호출
-#      - 아니면 systemctl reload 실패 시 restart
-#   9) 헬스체크
-#      - HEALTH_URL_OVERRIDE 우선, 없으면 mode에 따라 기본 URL 구성(page/actuator/none)
-#      - 실패 시 fail 처리
-#  10) 보관정책
-#      - releases/<app>/diff-<app>-* 최신순 정렬 후 KEEP_RELEASES 보다 오래된 스냅샷 삭제
-#  11) 산출물(zip) 반환
-#      - 원격: $REMOTE_DIR/artifacts/diff-deploy-artifacts.zip
-#        ( .env, changed-files.txt, deleted-files.txt, diff-base.env, live-pointer.env 포함 )
+# 사용 시나리오:
+#   GitLab CI/CD 파이프라인에서, release/deploy 단계에서 호출.
+#   신규 WAR 업로드 시, 전체 배포 대신 차분만 적용.
+#
+# 디렉터리 구조 예시 (/opt/tomcat 기준)
+# ├── webapps/
+# │   ├── devops -> ../releases/devops/diff-devops-22.3.1-20251021183055   ← LIVE 심볼릭 링크
+# │   ├── ROOT/
+# │   └── ...
+# ├── releases/
+# │   └── devops/
+# │       ├── diff-devops-22.3.0-20251020175644/
+# │       │   ├── WEB-INF/
+# │       │   ├── static/
+# │       │   └── _logs/
+# │       │       ├── changed-files.txt
+# │       │       ├── deleted-files.txt
+# │       │       ├── diff-base.env
+# │       │       └── live-pointer.env       ← CURRENT, PREV 기록
+# │       └── diff-devops-22.3.1-20251021183055/    ← 신규 대상
+# ├── artifacts/
+# │   └── devops/
+# │       └── devops-22.3.1/
+# │           ├── WEB-INF/
+# │           └── static/
+# └── logs/
 #
 # 주요 경로(코드 기본값):
 #   WEBAPPS_ROOT   : /opt/tomcat/webapps
@@ -1294,6 +1282,43 @@
 #   DEPLOY_USER=""
 #   DEPLOY_PASS=""
 #   WAS_URL=127.0.0.1:8080
+#
+# SSH 접속후 실행되는 REMOTE_SH 의 주요 디렉토리 정리 
+#   LIVE_LINK : /opt/tomcat/webapps/<context>
+#    - Tomcat이 실제 서비스로 사용하는 경로 (항상 이 링크를 바라봄)
+#    - diff 배포 후 여기의 심링크가 TARGET 으로 교체됨
+#
+#   BASE_DIR : LIVE_LINK 이 가리키는 실제 디렉터리 경로
+#    - diff 비교의 기준(old)으로 사용됨
+#    - 이전 버전의 배포본
+#
+#   TARGET : /opt/tomcat/releases/<app>/diff-<app>-<ver>-<ts>
+#    - 새로 배포될 버전 (NEW 기준으로 변경/삭제 반영 후 LIVE 로 전환)
+#    - 배포 완료 후 LIVE_LINK → TARGET 으로 심링크 변경
+#
+#   NEW_DIR : /opt/tomcat/artifacts/<app>/<app>-<ver>
+#    - Nexus에서 WAR를 받아 unzip한 결과물
+#    - diff 비교의 기준(new)으로 사용
+#
+#   APP_RELEASES_DIR: /opt/tomcat/releases/<app>
+#    - 모든 diff-* 스냅샷(TARGET/BASE) 저장소
+#    - prune_releases()가 KEEP_RELEASES 기준으로 오래된 버전 정리
+#
+#   ARTIFACTS_BASE : /opt/tomcat/artifacts
+#    - NEW_DIR들이 모여있는 워크 디렉터리
+#    - 용량 관리 필요(장기 보존 불필요)
+#
+#   REMOTE_DIR : /tmp/gitlab-build-$CI_PIPELINE_ID
+#    - 원격 임시 작업 디렉터리 (SSH 배포 시 임시 ZIP·로그 보관)
+#    - Runner 수집 후 삭제 가능
+#
+#   _logs (LOG_DIR) : <TARGET>/_logs
+#    - diff 결과 및 메타데이터 기록
+#     · diff-base.env         : BASE_DIR 정보
+#     · changed-files.txt     : 변경 목록
+#     · deleted-files.txt     : 삭제 목록
+#     · live-pointer.env      : CURRENT / PREV 릴리스 포인터
+#    - 첫 배포(비교 대상 없음) 시 생성 생략 가능
 #
 # 주의사항(코드 반영됨):
 #   - 모든 파일 생성/이동/삭제/링크는 sudo 사용.
@@ -1353,234 +1378,289 @@
       log "Created temporary diff deploy script: $remote_script"
 
       cat > "$remote_script" <<'REMOTE_SH'
+
+      #!/usr/bin/env bash
       set -eu
 
+      # ───────────────────────────────────────────────
+      # 공통 유틸 함수
+      # ───────────────────────────────────────────────
       log()  { printf '[INFO] %s\n' "$*"; }
       ok()   { printf '[OK]   %s\n' "$*"; }
       fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
       need() { command -v "$1" >/dev/null 2>&1; }
       ts()   { date +%Y%m%d%H%M%S; }
+
+      # 파일 타입 검사 도우미
       is_link() { sudo test -L "$1"; }
       is_dir()  { sudo test -d "$1"; }
-      is_any()  { sudo test -e "$1" -o -L "$1"; }
+      # -o 대신 안전하게 두 번 검사
+      is_any()  { sudo test -e "$1" || sudo test -L "$1"; }
 
-      : "${REMOTE_DIR:?}"
-      : "${COMMIT_TAG:?}"
-      : "${CONTEXT_PATH:?}"
-      : "${WEBAPPS_ROOT:?}"
-      : "${RELEASES_BASE:?}"
-      : "${ARTIFACTS_BASE:?}"
-      : "${TOMCAT_SERVICE:?}"
-      : "${KEEP_RELEASES:?}"
-      : "${HEALTH_MODE:?}"
-      : "${HEALTH_URL_OVERRIDE:-}"
-      : "${HC_TIMEOUT:?}"
-      : "${HC_INTERVAL:?}"
-      : "${HOT_RELOAD:?}"
-      : "${DEPLOY_USER:-}"
-      : "${DEPLOY_PASS:-}"
-      : "${WAS_URL:?}"
-      : "${AUTO_FETCH_ON_MISSING:?}"
+      # ───────────────────────────────────────────────
+      # require_envs()
+      # 환경 변수 필수값 확인
+      # ───────────────────────────────────────────────
+      require_envs() {
+        : "${REMOTE_DIR:?REMOTE_DIR is required}"
+        : "${COMMIT_TAG:?COMMIT_TAG is required}"
+        : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+        : "${WEBAPPS_ROOT:?WEBAPPS_ROOT is required}"
+        : "${RELEASES_BASE:?RELEASES_BASE is required}"
+        : "${ARTIFACTS_BASE:?ARTIFACTS_BASE is required}"
+        : "${TOMCAT_SERVICE:?TOMCAT_SERVICE is required}"
+        : "${KEEP_RELEASES:?KEEP_RELEASES is required}"
+        : "${HEALTH_MODE:?HEALTH_MODE is required}"
+        : "${HC_TIMEOUT:?HC_TIMEOUT is required}"
+        : "${HC_INTERVAL:?HC_INTERVAL is required}"
+        : "${NEXUS_USER:?NEXUS_USER is required}"
+        : "${NEXUS_PASS:?NEXUS_PASS is required}"
+        : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+        : "${GROUP_ID:?GROUP_ID is required}"
+        : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      }
 
-      : "${NEXUS_USER:?}"
-      : "${NEXUS_PASS:?}"
-      : "${RELEASE_REPO_URL:?}"
-      : "${GROUP_ID:?}"
-      : "${ARTIFACT_ID:?}"
-
-      APP_NAME="$(printf "%s" "${CONTEXT_PATH#/}")"
-      DEPLOY_VERSION="${COMMIT_TAG#v}"
-
-      LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
-      APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
-      NEW_DIR="${ARTIFACTS_BASE%/}/${APP_NAME}/${APP_NAME}-${DEPLOY_VERSION}"
-
-      # 원격/산출물 경로
-      ART_DIR="$REMOTE_DIR/artifacts"
-      OUT_ZIP="$ART_DIR/diff-deploy-artifacts.zip"
-
-      uid="$(id -u)"; gid="$(id -g)"
-      sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
-      sudo chown -R "$uid:$gid" "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
-
-      for t in rsync ln readlink zip awk sed grep sort uniq curl unzip mktemp df ls tee; do
-        if ! need "$t"; then
-          if   need apk; then sudo apk add --no-cache "$t" || true
-          elif need apt-get; then sudo apt-get update -y && sudo apt-get install -y "$t" || true
-          elif need dnf; then sudo dnf install -y "$t" || true
+      # ───────────────────────────────────────────────
+      # ensure_tools()
+      # 필수 도구 설치 확인 (rsync, unzip 등)
+      # ───────────────────────────────────────────────
+      ensure_tools() {
+        for t in rsync ln readlink zip awk sed grep sort uniq curl unzip mktemp df ls tee realpath; do
+          if ! need "$t"; then
+            if   need apk; then
+              sudo apk add --no-cache coreutils "$t" || true
+            elif need apt-get; then
+              sudo apt-get update -y && sudo apt-get install -y "$t" || true
+            elif need dnf; then
+              sudo dnf install -y "$t" || true
+            fi
           fi
+        done
+      }
+
+      # ───────────────────────────────────────────────
+      # setup_context()
+      # 디렉터리 및 배포 경로 설정
+      # ───────────────────────────────────────────────
+      setup_context() {
+        APP_NAME="${CONTEXT_PATH#/}"
+        DEPLOY_VERSION="${COMMIT_TAG#v}"
+
+        LIVE_LINK="${WEBAPPS_ROOT%/}/$APP_NAME"
+        APP_RELEASES_DIR="${RELEASES_BASE%/}/$APP_NAME"
+        NEW_DIR="${ARTIFACTS_BASE%/}/$APP_NAME/$APP_NAME-$DEPLOY_VERSION"
+
+        ART_DIR="$REMOTE_DIR/artifacts"
+        OUT_ZIP="$ART_DIR/diff-deploy-artifacts.zip"
+
+        uid="$(id -u)"; gid="$(id -g)"
+        sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
+        sudo chown -R "$uid:$gid" "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
+      }
+
+      # ───────────────────────────────────────────────
+      # maybe_fetch_new_dir()
+      # NEW_DIR이 없을 경우 Nexus에서 WAR 자동 다운로드 및 unzip
+      # ───────────────────────────────────────────────
+      maybe_fetch_new_dir() {
+        if [ -d "$NEW_DIR" ]; then
+          log "기존 NEW_DIR 사용: $NEW_DIR"
+          return
         fi
-      done
-      need rsync || fail "rsync not available"
+        log "NEW_DIR 없음 → Nexus에서 자동 생성"
+        APP_PATH="${GROUP_ID//.//}/${ARTIFACT_ID}/${DEPLOY_VERSION}"
+        NEW_WAR="${ARTIFACT_ID}-${DEPLOY_VERSION}.war"
+        NEW_URL="${RELEASE_REPO_URL%/}/${APP_PATH}/${NEW_WAR}"
+        TMP_DIR=$(sudo mktemp -d /tmp/${APP_NAME}-${DEPLOY_VERSION}-fetch.XXXXXX)
 
-      # NEW_DIR 확보
-      if [ ! -d "$NEW_DIR" ]; then
-        if [ "$AUTO_FETCH_ON_MISSING" = "true" ]; then
-          log "NEW_DIR not found → auto-create from Nexus"
-          APP_PATH="${GROUP_ID//.//}/${ARTIFACT_ID}/${DEPLOY_VERSION}"
-          NEW_WAR="${ARTIFACT_ID}-${DEPLOY_VERSION}.war"
-          NEW_URL="${RELEASE_REPO_URL%/}/${APP_PATH}/${NEW_WAR}"
-          TMP_DIR=$(sudo mktemp -d /tmp/${APP_NAME}-${DEPLOY_VERSION}-fetch.XXXXXX)
-          sudo df -h / /tmp "$REMOTE_DIR" 2>/dev/null || true
+        sudo curl -fsSL -u "$NEXUS_USER:$NEXUS_PASS" -o "$TMP_DIR/$NEW_WAR" "$NEW_URL"
+        sudo unzip -q "$TMP_DIR/$NEW_WAR" -d "$TMP_DIR/unzip"
+        sudo test -d "$TMP_DIR/unzip/WEB-INF" || fail "WAR 구조 이상"
+        sudo mkdir -p "$(dirname "$NEW_DIR")"
+        sudo rm -rf "$NEW_DIR"
+        sudo mv "$TMP_DIR/unzip" "$NEW_DIR"
+        sudo rm -rf "$TMP_DIR"
+        ok "NEW_DIR 생성 완료: $NEW_DIR"
+      }
 
-          log "Downloading WAR: $NEW_URL"
-          if ! sudo curl -fSL --retry 3 --retry-connrefused --max-time 600 \
-                 -u "$NEXUS_USER:$NEXUS_PASS" \
-                 -o "$TMP_DIR/$NEW_WAR" "$NEW_URL"; then
-            sudo ls -l "$TMP_DIR" || true
-            fail "Failed to download WAR from Nexus: $NEW_URL"
-          fi
-
-          log "Unzipping WAR to $NEW_DIR"
-          sudo unzip -q "$TMP_DIR/$NEW_WAR" -d "$TMP_DIR/unzip"
-          sudo unzip -tq "$TMP_DIR/$NEW_WAR" >/dev/null 2>&1 || fail "WAR integrity test failed"
-          sudo test -d "$TMP_DIR/unzip/WEB-INF" || fail "Invalid WAR structure (no WEB-INF)"
-          sudo mkdir -p "$(dirname "$NEW_DIR")"
-          sudo rm -rf "$NEW_DIR"
-          sudo mv "$TMP_DIR/unzip" "$NEW_DIR"
-          sudo rm -rf "$TMP_DIR"
-          ok "NEW_DIR created from Nexus: $NEW_DIR"
+      # ───────────────────────────────────────────────
+      # resolve_base_from_live()
+      # LIVE 심볼릭 링크에서 BASE_DIR 추출 또는 초기화
+      # ───────────────────────────────────────────────
+      resolve_base_from_live() {
+        prev_target=""
+        if is_link "$LIVE_LINK"; then
+          prev_target="$(sudo readlink -f "$LIVE_LINK" || true)"
+        elif is_dir "$LIVE_LINK"; then
+          seed="${APP_RELEASES_DIR}/diff-legacy-backup-$(ts)"
+          log "LIVE_DIR 기반 초기 백업 생성 → $seed"
+          sudo rsync -a --delete --exclude='_logs/**' "${LIVE_LINK%/}/" "${seed%/}/" || true
+          prev_target="$seed"
+          sudo ln -sT "$seed" "$LIVE_LINK" || true
         else
-          fail "NEW_DIR not found and AUTO_FETCH_ON_MISSING=false: $NEW_DIR"
+          log "LIVE_LINK가 없음 → 신규 서비스로 간주, 초기화 모드 실행"
+          seed="${APP_RELEASES_DIR}/diff-initial-${APP_NAME}-$(ts)"
+          sudo mkdir -p "$seed"
+          sudo cp -a "${NEW_DIR%/}/." "$seed/"
+          prev_target="$seed"
+          sudo ln -sT "$seed" "$LIVE_LINK"
+          ok "신규 서비스 초기화 완료: $seed"
         fi
-      else
-        log "Using existing NEW_DIR: $NEW_DIR"
-      fi
 
-      # LIVE 기준 확보/초기 마이그레이션
-      prev_target=""
-      if is_link "$LIVE_LINK"; then
-        prev_target="$(sudo readlink -f "$LIVE_LINK" || true)"
-      elif is_dir "$LIVE_LINK"; then
-        seed="${APP_RELEASES_DIR}/diff-legacy-backup-$(ts)"
-        log "Seeding legacy snapshot from LIVE DIR -> $seed"
-        sudo rsync -a --delete "${LIVE_LINK%/}/" "${seed%/}/" || true
-        prev_target="$seed"
-        tmp_link="${LIVE_LINK}.new.$(ts)"
-        sudo ln -sT "$seed" "$tmp_link" 2>/dev/null || sudo ln -s "$seed" "$tmp_link"
-        sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || { sudo rm -rf --one-file-system "$LIVE_LINK"; sudo mv "$tmp_link" "$LIVE_LINK"; }
-      elif is_any "$LIVE_LINK"; then
-        seed="${APP_RELEASES_DIR}/diff-legacy-backup-$(ts)"
-        log "Seeding legacy snapshot (non-dir LIVE) -> $seed"
-        sudo rm -rf --one-file-system "$LIVE_LINK" || true
-        sudo rsync -a "${NEW_DIR%/}/" "${seed%/}/" || true
-        prev_target="$seed"
-        tmp_link="${LIVE_LINK}.new.$(ts)"
-        sudo ln -sT "$seed" "$tmp_link" 2>/dev/null || sudo ln -s "$seed" "$tmp_link"
-        sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || { sudo rm -rf --one-file-system "$LIVE_LINK"; sudo mv "$tmp_link" "$LIVE_LINK"; }
-      fi
-
-      BASE_DIR=""
-      if is_link "$LIVE_LINK"; then
         BASE_DIR="$(sudo readlink -f "$LIVE_LINK" || true)"
-      fi
-      [ -n "$BASE_DIR" ] || fail "Cannot resolve BASE_DIR from LIVE_LINK: $LIVE_LINK"
-      [ -n "$prev_target" ] || prev_target="$BASE_DIR"
+        [ -n "$BASE_DIR" ] || fail "BASE_DIR 확인 실패"
+        [ -n "$prev_target" ] || prev_target="$BASE_DIR"
+      }
 
-      # TARGET 준비
-      stamp="$(ts)"
-      TARGET="${APP_RELEASES_DIR}/diff-${APP_NAME}-${DEPLOY_VERSION}-${stamp}"
-      log "Prepare TARGET: $TARGET"
-      sudo mkdir -p "$TARGET"
-      sudo rsync -a --delete "${prev_target%/}/" "${TARGET%/}/" || true
+      # ───────────────────────────────────────────────
+      # prepare_target_from_prev()
+      # 이전 릴리스 복제 후 TARGET 디렉터리 생성
+      # ───────────────────────────────────────────────
+      prepare_target_from_prev() {
+        stamp="$(ts)"
+        TARGET="${APP_RELEASES_DIR}/diff-${APP_NAME}-${DEPLOY_VERSION}-${stamp}"
+        log "새 TARGET 생성: $TARGET"
+        sudo mkdir -p "$TARGET"
+        sudo rsync -a --delete  --exclude='_logs/**' "${prev_target%/}/" "${TARGET%/}/" || true
 
-      # TARGET/_logs
-      LOG_DIR="${TARGET%/}/_logs"
-      sudo mkdir -p "$LOG_DIR"
-      sudo chown -R "$uid:$gid" "$LOG_DIR"
+        LOG_DIR="${TARGET%/}/_logs"
+        sudo rm -rf "$LOG_DIR"
+        sudo mkdir -p "$LOG_DIR"
+        sudo chown -R "$uid:$gid" "$LOG_DIR"
 
-      DIFF_BASE_FILE="$LOG_DIR/diff-base.env"        # (구 deploy.log)
-      LIVE_POINTER_FILE="$LOG_DIR/live-pointer.env"  # (구 rollback.log)
-      CHANGED_LIST="$LOG_DIR/changed-files.txt"
-      DELETE_LIST="$LOG_DIR/deleted-files.txt"
-      : > "$CHANGED_LIST"; : > "$DELETE_LIST"
-      printf 'BASE_DIR=%s\n' "$BASE_DIR" > "$DIFF_BASE_FILE"
+        DIFF_BASE_FILE="$LOG_DIR/diff-base.env"
+        LIVE_POINTER_FILE="$LOG_DIR/live-pointer.env"
+        CHANGED_LIST="$LOG_DIR/changed-files.txt"
+        DELETE_LIST="$LOG_DIR/deleted-files.txt"
+        : > "$CHANGED_LIST"; : > "$DELETE_LIST"
+        printf 'BASE_DIR=%s\n' "$BASE_DIR" > "$DIFF_BASE_FILE"
+      }
 
-      # 변경/삭제 목록(dry-run) - _logs & 잡파일 제외
-      log "Rsync dry-run NEW vs BASE to compute changes"
-      mapfile -t lines < <(sudo rsync -ai --delete --dry-run --out-format='%i %n' \
-        --exclude='_logs/**' \
-        --exclude='*.bad' --exclude='*.tmp' --exclude='*.bak' --exclude='*.swp' --exclude='*.log' \
-        "${NEW_DIR%/}/" "${BASE_DIR%/}/")
-      for ln in "${lines[@]}"; do
-        if printf '%s\n' "$ln" | grep -q '^\*deleting '; then
-          f="${ln#*deleting }"
-          echo "$f" >> "$DELETE_LIST"
-          continue
-        fi
-        if printf '%s\n' "$ln" | grep -qE '^(>f|\.*f\+|\>d)'; then
-          f="$(printf '%s' "$ln" | sed 's/^[^ ]\+ //')"
-          [[ "$f" == */ ]] && continue
-          echo "$f" >> "$CHANGED_LIST"
-        fi
-      done
-      [ -s "$CHANGED_LIST" ] && sort -u "$CHANGED_LIST" -o "$CHANGED_LIST" || true
-      [ -s "$DELETE_LIST" ] && sort -u "$DELETE_LIST" -o "$DELETE_LIST" || true
+      # ───────────────────────────────────────────────
+      # compute_diff_lists()
+      # rsync dry-run 결과를 기반으로 변경/삭제 파일 목록 계산
+      # ───────────────────────────────────────────────
+      compute_diff_lists() {
+        log "Rsync dry-run 실행 중 (NEW vs BASE)"
+        mapfile -t lines < <(sudo rsync -ai --delete --dry-run --out-format='%i %n' \
+          --exclude='_logs/**' --exclude='*.bad' --exclude='*.tmp' \
+          --exclude='*.bak' --exclude='*.swp' --exclude='*.log' \
+          "${NEW_DIR%/}/" "${BASE_DIR%/}/")
 
-      log "Changed files: $(wc -l < "$CHANGED_LIST" || echo 0)"
-      log "Deleted files: $(wc -l < "$DELETE_LIST" || echo 0)"
-
-      # 삭제 반영
-      if [ -s "$DELETE_LIST" ]; then
-        while IFS= read -r rel; do
-          [ -z "$rel" ] && continue
-          sudo rm -rf --one-file-system "${TARGET%/}/$rel" || true
-        done < "$DELETE_LIST"
-      fi
-
-      # 변경/추가 반영
-      changed=0
-      if [ -s "$CHANGED_LIST" ]; then
-        sudo rsync -a --files-from="$CHANGED_LIST" "${NEW_DIR%/}/" "${TARGET%/}/" || true
-        changed=1
-      fi
-
-      # LIVE 전환
-      tmp_link="${LIVE_LINK}.new.$(ts)"
-      sudo ln -sT "$TARGET" "$tmp_link" 2>/dev/null || sudo ln -s "$TARGET" "$tmp_link"
-      sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || { sudo rm -rf --one-file-system "$LIVE_LINK"; sudo mv "$tmp_link" "$LIVE_LINK"; }
-      log "LIVE -> $TARGET"
-
-      # LIVE 포인터 기록 (CURRENT, PREV)
-      printf 'CURRENT=%s\n' "$TARGET" > "$LIVE_POINTER_FILE"
-      printf 'PREV=%s\n' "$BASE_DIR" >> "$LIVE_POINTER_FILE"
-
-      # Tomcat 적용
-      if [ "$HOT_RELOAD" = "true" ] && [ -n "$DEPLOY_USER" ] && [ -n "$DEPLOY_PASS" ] && need curl; then
-        sudo curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" >/dev/null 2>&1 || true
-      else
-        if need systemctl; then
-          if sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null; then
-            :
-          else
-            sudo systemctl restart "$TOMCAT_SERVICE"
+        for ln in "${lines[@]}"; do
+          if printf '%s\n' "$ln" | grep -q '^\*deleting '; then
+            f="${ln#*deleting }"
+            echo "$f" >> "$DELETE_LIST"
+          elif printf '%s\n' "$ln" | grep -qE '^(>f|\.f\+|>d)'; then
+            f="$(printf '%s' "$ln" | sed 's/^[^ ]\+ //')"
+            [[ "$f" == */ ]] && continue
+            echo "$f" >> "$CHANGED_LIST"
           fi
-        fi
-      fi
+        done
+      }
 
-      # 헬스체크
-      hc_url=""
-      if [ -n "$HEALTH_URL_OVERRIDE" ]; then
-        hc_url="$HEALTH_URL_OVERRIDE"
-      else
+      # ───────────────────────────────────────────────
+      # apply_deletions()
+      # DELETE_LIST 기반 안전 삭제 (심볼릭 링크는 링크 자체만 제거)
+      # ───────────────────────────────────────────────
+      apply_deletions() {
+        local target="$1" list="$2"
+        rp_tgt="$(realpath -m -- "$target")"
+        pushd "$rp_tgt" >/dev/null
+
+        while IFS= read -r rel || [[ -n "${rel:-}" ]]; do
+          [[ -z "$rel" ]] && continue
+          if [[ "$rel" = /* || "$rel" = *".."* ]]; then
+            echo "[SKIP] 위험 경로: $rel"
+            continue
+          fi
+          if [[ -L "$rel" ]]; then
+            echo "[DEL] (symlink) $rel"
+            sudo rm -f -- "$rel"
+          elif [[ -e "$rel" ]]; then
+            echo "[DEL] $rel"
+            sudo rm -rf --one-file-system -- "$rel"
+          fi
+        done < "$list"
+
+        popd >/dev/null
+      }
+
+      # ───────────────────────────────────────────────
+      # apply_changes()
+      # CHANGED_LIST 기반으로 변경 파일만 복사
+      # ───────────────────────────────────────────────
+      apply_changes() {
+        if [ -s "$CHANGED_LIST" ]; then
+          sudo rsync -a --files-from="$CHANGED_LIST" "${NEW_DIR%/}/" "${TARGET%/}/"
+        fi
+      }
+
+      # ───────────────────────────────────────────────
+      # switch_live_symlink()
+      # LIVE 심볼릭 링크를 새 TARGET으로 전환
+      # ───────────────────────────────────────────────
+      switch_live_symlink() {
+        tmp_link="${LIVE_LINK}.new.$(ts)"
+        sudo ln -sT "$TARGET" "$tmp_link" || sudo ln -s "$TARGET" "$tmp_link"
+        sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || {
+          sudo rm -rf --one-file-system "$LIVE_LINK"
+          sudo mv "$tmp_link" "$LIVE_LINK"
+        }
+        log "LIVE → $TARGET 전환 완료"
+      }
+
+      # ───────────────────────────────────────────────
+      # update_live_pointer()
+      # 심링크 교체후에 라이브 포인터 정보 재기록
+      # ───────────────────────────────────────────────
+      update_live_pointer() {
+        # 현재(LIVE)는 이제 TARGET, 이전은 prev_target (혹은 BASE_DIR)로 기록
+        local current="$TARGET"
+        local prev="$prev_target"   # BASE_DIR을 쓰고 싶다면 prev="$BASE_DIR"
+        sudo sh -c "printf 'CURRENT=%s\nPREV=%s\n' '$current' '${prev:-}' > '$TARGET/_logs/live-pointer.env'"
+      }
+
+      # ───────────────────────────────────────────────
+      # reload_or_restart_tomcat()
+      # Tomcat 핫리로드 or 재기동 처리
+      # ───────────────────────────────────────────────
+      reload_or_restart_tomcat() {
+        if [ "$HOT_RELOAD" = "true" ] && [ -n "$DEPLOY_USER" ]; then
+          sudo curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" || true
+        else
+          sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null || sudo systemctl restart "$TOMCAT_SERVICE"
+        fi
+      }
+
+      # ───────────────────────────────────────────────
+      # do_healthcheck()
+      # 배포 후 서비스 정상 응답 확인
+      # ───────────────────────────────────────────────
+      do_healthcheck() {
         case "$HEALTH_MODE" in
           actuator) hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
           page)     hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
-          none)     hc_url="" ;;
+          none)     return ;;
           *)        hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
         esac
-      fi
-      if [ -n "$hc_url" ] && need curl; then
-        elapsed=0; ok_flag=0
+
+        elapsed=0
         while [ "$elapsed" -lt "$HC_TIMEOUT" ]; do
-          if sudo curl -fsS --max-time 3 "$hc_url" >/dev/null 2>&1; then ok_flag=1; break; fi
+          if sudo curl -fsS --max-time 3 "$hc_url" >/dev/null 2>&1; then
+            ok "헬스체크 성공: $hc_url"
+            return
+          fi
           sleep "$HC_INTERVAL"; elapsed=$((elapsed+HC_INTERVAL))
         done
-        [ "$ok_flag" = 1 ] || fail "Health check failed: $hc_url"
-      fi
+        fail "헬스체크 실패: $hc_url"
+      }
 
-      # 보관정책
-      if need ls; then
+      # ───────────────────────────────────────────────
+      # prune_releases()
+      # KEEP_RELEASES 초과 버전 정리
+      # ───────────────────────────────────────────────
+      prune_releases() {
         mapfile -t snaps < <(sudo ls -1dt "${APP_RELEASES_DIR}/diff-${APP_NAME}-"* 2>/dev/null || true)
         if [ "${#snaps[@]}" -gt "$KEEP_RELEASES" ]; then
           for ((i=KEEP_RELEASES; i<${#snaps[@]}; i++)); do
@@ -1588,27 +1668,51 @@
             sudo rm -rf --one-file-system "${snaps[$i]}" || true
           done
         fi
-      fi
+      }
 
-      # 산출물(zip) 구성: TARGET/_logs → ART_DIR 복사
-      sudo cp -f "$DIFF_BASE_FILE" "$ART_DIR/diff-base.env" || true
-      sudo cp -f "$LIVE_POINTER_FILE" "$ART_DIR/live-pointer.env" || true
-      sudo cp -f "$CHANGED_LIST" "$ART_DIR/changed-files.txt" || true
-      sudo cp -f "$DELETE_LIST" "$ART_DIR/deleted-files.txt" || true
-      sudo chown "$uid:$gid" "$ART_DIR"/* 2>/dev/null || true
+      # ───────────────────────────────────────────────
+      # package_artifacts()
+      # 로그, 목록 파일 등을 ZIP으로 압축
+      # ───────────────────────────────────────────────
+      package_artifacts() {
+        sudo cp -f "$DIFF_BASE_FILE" "$ART_DIR/diff-base.env" || true
+        sudo cp -f "$CHANGED_LIST" "$ART_DIR/changed-files.txt" || true
+        sudo cp -f "$DELETE_LIST" "$ART_DIR/deleted-files.txt" || true
 
-      {
-        echo "DEPLOYED_VERSION=$DEPLOY_VERSION"
-        echo "LIVE_LINK=$LIVE_LINK"
-        echo "TARGET=$TARGET"
-        echo "BASE_DIR=$BASE_DIR"
-        echo "CHANGED=$changed"
-        echo "LOG_DIR=$LOG_DIR"
-      } > "$ART_DIR/.env"
+        {
+          echo "DEPLOYED_VERSION=$DEPLOY_VERSION"
+          echo "LIVE_LINK=$LIVE_LINK"
+          echo "TARGET=$TARGET"
+          echo "BASE_DIR=$BASE_DIR"
+        } > "$ART_DIR/.env"
 
-      ( cd "$ART_DIR" && zip -r "$(basename "$OUT_ZIP")" ".env" "diff-base.env" "live-pointer.env" "changed-files.txt" "deleted-files.txt" >/dev/null 2>&1 || true )
-      ok "Diff deploy completed"
-      echo "$OUT_ZIP"
+        ( cd "$ART_DIR" && zip -r "$(basename "$OUT_ZIP")" .env *.txt >/dev/null 2>&1 )
+        ok "배포 로그 ZIP 생성 완료"
+        echo "$OUT_ZIP"
+      }
+
+      # ───────────────────────────────────────────────
+      # main
+      # ───────────────────────────────────────────────
+      main() {
+        require_envs
+        ensure_tools
+        setup_context
+        maybe_fetch_new_dir
+        resolve_base_from_live
+        prepare_target_from_prev
+        compute_diff_lists
+        apply_deletions "$TARGET" "$DELETE_LIST"
+        apply_changes
+        switch_live_symlink
+        reload_or_restart_tomcat
+        do_healthcheck
+        prune_releases
+        package_artifacts
+      }
+
+      main "$@"
+
     REMOTE_SH
 
       log "▶ Executing diff deploy via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
@@ -1770,9 +1874,11 @@
       remote_script=$(mktemp /tmp/remote_diff_restore.XXXXXX)
       log "Created temporary diff restore script: $remote_script"
 
-      cat > "$remote_script" <<'REMOTE_SH'
+      cat > "$remote_script" <<'REMOTE_SH' 
+      #!/usr/bin/env bash
       set -eu
 
+      # ── 공통 유틸 ───────────────────────────────────────
       log()  { printf '[INFO] %s\n' "$*"; }
       ok()   { printf '[OK]   %s\n' "$*"; }
       fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
@@ -1781,87 +1887,110 @@
       is_link() { sudo test -L "$1"; }
       is_dir()  { sudo test -d "$1"; }
 
-      : "${REMOTE_DIR:?}"
-      : "${CONTEXT_PATH:?}"
-      : "${WEBAPPS_ROOT:?}"
-      : "${RELEASES_BASE:?}"
-      : "${TOMCAT_SERVICE:?}"
-      : "${WAS_URL:?}"
-      : "${ROLLBACK_TO_NAME:-}"
-      : "${ROLLBACK_TO_VERSION:-}"
-      : "${HEALTH_MODE:?}"
-      : "${HEALTH_URL_OVERRIDE:-}"
-      : "${HC_TIMEOUT:?}"
-      : "${HC_INTERVAL:?}"
-      : "${HOT_RELOAD:?}"
-      : "${DEPLOY_USER:-}"
-      : "${DEPLOY_PASS:-}"
-      : "${RESTORE_LOG_NAME:?}"
-      : "${MARK_BAD_ON_ROLLBACK:?}"
-      : "${BAD_MARKER_NAME:?}"
+      # ── 입력 검증 ───────────────────────────────────────
+      require_envs() {
+        : "${REMOTE_DIR:?}"
+        : "${CONTEXT_PATH:?}"
+        : "${WEBAPPS_ROOT:?}"
+        : "${RELEASES_BASE:?}"
+        : "${TOMCAT_SERVICE:?}"
+        : "${WAS_URL:?}"
+        : "${ROLLBACK_TO_NAME:-}"
+        : "${ROLLBACK_TO_VERSION:-}"
+        : "${HEALTH_MODE:?}"
+        : "${HEALTH_URL_OVERRIDE:-}"
+        : "${HC_TIMEOUT:?}"
+        : "${HC_INTERVAL:?}"
+        : "${HOT_RELOAD:?}"
+        : "${DEPLOY_USER:-}"
+        : "${DEPLOY_PASS:-}"
+        : "${RESTORE_LOG_NAME:?}"
+        : "${MARK_BAD_ON_ROLLBACK:?}"
+        : "${BAD_MARKER_NAME:?}"
+      }
 
-      APP_NAME="$(printf "%s" "${CONTEXT_PATH#/}")"
-      LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
-      APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
-
-      ART_DIR="$REMOTE_DIR/artifacts"
-      LOG="$ART_DIR/$RESTORE_LOG_NAME"
-      OUT_ZIP="$ART_DIR/diff-restore-artifacts.zip"
-
-      sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
-      : > "$LOG"
-
-      for t in ln readlink zip ls grep awk sed curl; do
-        if ! need "$t"; then
-          if   need apk; then sudo apk add --no-cache "$t" || true
-          elif need apt-get; then sudo apt-get update -y && sudo apt-get install -y "$t" || true
-          elif need dnf; then sudo dnf install -y "$t" || true
-          fi
-        fi
-      done
-
-      # 현재 LIVE 대상
-      current=""
-      if is_link "$LIVE_LINK"; then
-        current="$(sudo readlink -f "$LIVE_LINK" || true)"
-      fi
-      echo "CURRENT=$current" | tee -a "$LOG"
-
-      # 후보 수집(최신순) + BAD 제외
-      mapfile -t rels < <(
-        ls -1dt "${APP_RELEASES_DIR}/diff-${APP_NAME}-"* 2>/dev/null \
-        | while read -r d; do
-            if sudo test -f "$d/$BAD_MARKER_NAME"; then
-              continue
+      # ── 도구 확인/설치 ─────────────────────────────────
+      ensure_tools() {
+        local tools="ln readlink zip ls grep awk sed curl"
+        for t in $tools; do
+          if ! need "$t"; then
+            if   need apk;     then sudo apk add --no-cache "$t" || true
+            elif need apt-get; then sudo apt-get update -y && sudo apt-get install -y "$t" || true
+            elif need dnf;     then sudo dnf install -y "$t" || true
             fi
-            printf "%s\n" "$d"
-          done
-      )
+          fi
+        done
+        # systemctl은 선택
+      }
 
-      target=""; resolved_by=""
+      # ── 컨텍스트 구성 ───────────────────────────────────
+      setup_context() {
+        APP_NAME="${CONTEXT_PATH#/}"
+        LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
+        APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
 
-      # 1) 이름 우선
-      if [ -z "$target" ] && [ -n "$ROLLBACK_TO_NAME" ]; then
-        cand="${APP_RELEASES_DIR}/${ROLLBACK_TO_NAME}"
+        ART_DIR="$REMOTE_DIR/artifacts"
+        LOG="$ART_DIR/$RESTORE_LOG_NAME"
+        OUT_ZIP="$ART_DIR/diff-restore-artifacts.zip"
+
+        sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
+        : > "$LOG"
+      }
+
+      # ── 현재 LIVE 대상 확인 ────────────────────────────
+      get_current_live() {
+        CURRENT=""
+        if is_link "$LIVE_LINK"; then
+          CURRENT="$(sudo readlink -f "$LIVE_LINK" || true)"
+        fi
+        echo "CURRENT=$CURRENT" | tee -a "$LOG"
+      }
+
+      # ── 후보 스냅샷 수집 (최신순, BAD 제외) ─────────────
+      collect_candidates() {
+        local list
+        mapfile -t list < <(
+          ls -1dt "${APP_RELEASES_DIR}/diff-${APP_NAME}-"* 2>/dev/null \
+          | while read -r d; do
+              if sudo test -f "$d/$BAD_MARKER_NAME"; then
+                continue
+              fi
+              printf "%s\n" "$d"
+            done
+        )
+        CANDIDATES=("${list[@]}")
+      }
+
+      # ── 후보 결정 1: 이름 강제 ──────────────────────────
+      resolve_by_name() {
+        [ -n "${ROLLBACK_TO_NAME:-}" ] || return 1
+        local cand="${APP_RELEASES_DIR}/${ROLLBACK_TO_NAME}"
         [ -d "$cand" ] || fail "rollback target not found: $cand"
-        target="$cand"; resolved_by="override:name"
-      fi
+        TARGET="$cand"; RESOLVED_BY="override:name"
+        return 0
+      }
 
-      # 2) 버전 우선
-      if [ -z "$target" ] && [ -n "$ROLLBACK_TO_VERSION" ]; then
-        [ "${#rels[@]}" -ge 1 ] || fail "no diff snapshots found"
-        for d in "${rels[@]}"; do
+      # ── 후보 결정 2: 버전 강제 ───────────────────────────
+      resolve_by_version() {
+        [ -n "${ROLLBACK_TO_VERSION:-}" ] || return 1
+        [ "${#CANDIDATES[@]}" -ge 1 ] || fail "no diff snapshots found"
+        local d base ver
+        for d in "${CANDIDATES[@]}"; do
           base="$(basename "$d")"
           ver="$(printf "%s" "$base" | sed -E "s/^diff-${APP_NAME}-([^-]+)-.*/\1/")"
-          if [ "$ver" = "$ROLLBACK_TO_VERSION" ]; then target="$d"; resolved_by="override:version"; break; fi
+          if [ "$ver" = "$ROLLBACK_TO_VERSION" ]; then
+            TARGET="$d"; RESOLVED_BY="override:version"; return 0
+          fi
         done
-        [ -n "$target" ] || fail "no snapshot found for version: $ROLLBACK_TO_VERSION"
-      fi
+        fail "no snapshot found for version: $ROLLBACK_TO_VERSION"
+      }
 
-      # 3) 현재 타깃의 _logs/diff-base.env → BASE_DIR
-      if [ -z "$target" ] && [ -n "$current" ] && [ -d "$current" ]; then
-        dbase="$current/_logs/diff-base.env"
-        lp="$current/_logs/live-pointer.env"
+      # ── 후보 결정 3: diff-base.env 기반 ─────────────────
+      resolve_by_diffbase() {
+        [ -n "${CURRENT:-}" ] && [ -d "${CURRENT:-}" ] || return 1
+        local dbase lp base_dir cur_in_log
+        dbase="$CURRENT/_logs/diff-base.env"
+        lp="$CURRENT/_logs/live-pointer.env"
         if sudo test -f "$lp"; then
           cur_in_log="$(sudo awk -F= '/^CURRENT=/{print $2}' "$lp" 2>/dev/null || true)"
           echo "CHECK live-pointer CURRENT=$cur_in_log" | tee -a "$LOG"
@@ -1869,93 +1998,144 @@
         if sudo test -f "$dbase"; then
           base_dir="$(sudo awk -F= '/^BASE_DIR=/{print $2}' "$dbase" 2>/dev/null || true)"
           if [ -n "$base_dir" ] && [ -d "$base_dir" ]; then
-            target="$base_dir"; resolved_by="diff-base.env"
+            TARGET="$base_dir"; RESOLVED_BY="diff-base.env"; return 0
           fi
         fi
-      fi
+        return 1
+      }
 
-      # 4) 목록 기반 폴백(현재의 한 칸 이전)
-      if [ -z "$target" ]; then
-        [ "${#rels[@]}" -ge 1 ] || fail "no diff snapshots found"
-        if [ -n "$current" ]; then
-          found=0; idx=0
-          for ((i=0; i<${#rels[@]}; i++)); do
-            [ "$(sudo readlink -f "${rels[$i]}")" = "$current" ] && { found=1; idx=$i; break; }
+      # ── 후보 결정 4: 목록 폴백(현재 이전/세컨드 최신 등) ─
+      resolve_by_list() {
+        [ "${#CANDIDATES[@]}" -ge 1 ] || fail "no diff snapshots found"
+
+        if [ -n "${CURRENT:-}" ]; then
+          local found=0 idx=0 i
+          for ((i=0; i<${#CANDIDATES[@]}; i++)); do
+            [ "$(sudo readlink -f "${CANDIDATES[$i]}")" = "$CURRENT" ] && { found=1; idx=$i; break; }
           done
-          if [ "$found" = 1 ] && [ $((idx+1)) -lt ${#rels[@]} ]; then
-            target="${rels[$((idx+1))]}"; resolved_by="list:prev-of-current"
-          else
-            if [ "${#rels[@]}" -ge 2 ]; then target="${rels[1]}"; resolved_by="list:second-latest"; else target="${rels[0]}"; resolved_by="list:latest"; fi
+          if [ "$found" = 1 ] && [ $((idx+1)) -lt ${#CANDIDATES[@]} ]; then
+            TARGET="${CANDIDATES[$((idx+1))]}"; RESOLVED_BY="list:prev-of-current"; return 0
           fi
+        fi
+
+        if [ "${#CANDIDATES[@]}" -ge 2 ]; then
+          TARGET="${CANDIDATES[1]}"; RESOLVED_BY="list:second-latest"
         else
-          if [ "${#rels[@]}" -ge 2 ]; then target="${rels[1]}"; resolved_by="list:second-latest"; else target="${rels[0]}"; resolved_by="list:latest"; fi
+          TARGET="${CANDIDATES[0]}"; RESOLVED_BY="list:latest"
         fi
-      fi
+        return 0
+      }
 
-      [ -n "$target" ] && [ -d "$target" ] || fail "rollback target invalid"
-      echo "TARGET=$target (resolved_by=$resolved_by)" | tee -a "$LOG"
+      # ── LIVE 링크 전환 ──────────────────────────────────
+      switch_live() {
+        [ -n "${TARGET:-}" ] && [ -d "$TARGET" ] || fail "rollback target invalid"
+        echo "TARGET=$TARGET (resolved_by=$RESOLVED_BY)" | tee -a "$LOG"
 
-      # LIVE 전환
-      tmp_link="${LIVE_LINK}.new.$(ts)"
-      sudo ln -sT "$target" "$tmp_link" 2>/dev/null || sudo ln -s "$target" "$tmp_link"
-      sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || { sudo rm -rf --one-file-system "$LIVE_LINK"; sudo mv "$tmp_link" "$LIVE_LINK"; }
-      log "LIVE -> $target"
+        local tmp_link="${LIVE_LINK}.new.$(ts)"
+        sudo ln -sT "$TARGET" "$tmp_link" 2>/dev/null || sudo ln -s "$TARGET" "$tmp_link"
+        sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || {
+          sudo rm -rf --one-file-system "$LIVE_LINK"
+          sudo mv "$tmp_link" "$LIVE_LINK"
+        }
+        log "LIVE -> $TARGET"
+      }
 
-      # Tomcat 적용
-      if [ "$HOT_RELOAD" = "true" ] && [ -n "$DEPLOY_USER" ] && [ -n "$DEPLOY_PASS" ] && need curl; then
-        curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" >>"$LOG" 2>&1 || true
-      else
-        if need systemctl; then
-          if sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null; then
-            :
-          else
-            sudo systemctl restart "$TOMCAT_SERVICE"
+      # ── Tomcat 반영(핫리로드/재로드/재시작) ──────────────
+      apply_tomcat() {
+        if [ "$HOT_RELOAD" = "true" ] && [ -n "${DEPLOY_USER:-}" ] && [ -n "${DEPLOY_PASS:-}" ] && need curl; then
+          curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" >>"$LOG" 2>&1 || true
+        else
+          if need systemctl; then
+            if sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null; then
+              :
+            else
+              sudo systemctl restart "$TOMCAT_SERVICE"
+            fi
           fi
         fi
-      fi
+      }
 
-      # 헬스체크
-      hc_url=""
-      if [ -n "$HEALTH_URL_OVERRIDE" ]; then
-        hc_url="$HEALTH_URL_OVERRIDE"
-      else
-        case "$HEALTH_MODE" in
-          actuator) hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
-          page)     hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
-          none)     hc_url="" ;;
-          *)        hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
-        esac
-      fi
-      if [ -n "$hc_url" ] && need curl; then
-        elapsed=0; ok_flag=0
+      # ── Healthcheck ─────────────────────────────────────
+      healthcheck() {
+        local hc_url=""
+        if [ -n "${HEALTH_URL_OVERRIDE:-}" ]; then
+          hc_url="$HEALTH_URL_OVERRIDE"
+        else
+          case "$HEALTH_MODE" in
+            actuator) hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
+            page)     hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
+            none)     hc_url="" ;;
+            *)        hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
+          esac
+        fi
+
+        [ -n "$hc_url" ] || return 0
+        need curl || return 0
+
+        local elapsed=0 ok_flag=0
         while [ "$elapsed" -lt "$HC_TIMEOUT" ]; do
           if curl -fsS --max-time 3 "$hc_url" >/dev/null 2>&1; then ok_flag=1; break; fi
           sleep "$HC_INTERVAL"; elapsed=$((elapsed+HC_INTERVAL))
         done
         [ "$ok_flag" = 1 ] || fail "rollback health failed: $hc_url"
-      fi
+      }
 
-      # BAD 마킹(성공 롤백 후 이전 current에)
-      if [ -n "$current" ] && [ -d "$current" ] && [ "$MARK_BAD_ON_ROLLBACK" = "true" ]; then
-        sudo sh -c "printf 'marked bad on %s\n' \"$(date -Ins)\" > '$current/$BAD_MARKER_NAME'"
-      fi
+      # ── BAD 마커 처리 ───────────────────────────────────
+      mark_bad_if_needed() {
+        if [ -n "${CURRENT:-}" ] && [ -d "${CURRENT:-}" ] && [ "$MARK_BAD_ON_ROLLBACK" = "true" ]; then
+          sudo sh -c "printf 'marked bad on %s\n' \"$(date -Ins)\" > '$CURRENT/$BAD_MARKER_NAME'"
+        fi
+      }
 
-      # 대상 스냅샷의 live-pointer.env 갱신 (CURRENT, PREV)
-      if [ -d "$target/_logs" ]; then
-        sudo sh -c "printf 'CURRENT=%s\nPREV=%s\n' '$target' '${current:-}' > '$target/_logs/live-pointer.env'" || true
-      fi
+      # ── live-pointer.env 업데이트 ────────────────────────
+      update_live_pointer() {
+        if [ -d "$TARGET/_logs" ]; then
+          sudo sh -c "printf 'CURRENT=%s\nPREV=%s\n' '$TARGET' '${CURRENT:-}' > '$TARGET/_logs/live-pointer.env'" || true
+        fi
+      }
 
-      {
-        echo "ROLLED_BACK_FROM=${current:-}"
-        echo "ROLLED_BACK_TO=$target"
-        echo "LIVE_LINK=$LIVE_LINK"
-        echo "RESOLVED_BY=$resolved_by"
-      } > "$ART_DIR/.env"
+      # ── 산출물 패키징 ───────────────────────────────────
+      package_artifacts() {
+        {
+          echo "ROLLED_BACK_FROM=${CURRENT:-}"
+          echo "ROLLED_BACK_TO=$TARGET"
+          echo "LIVE_LINK=$LIVE_LINK"
+          echo "RESOLVED_BY=$RESOLVED_BY"
+        } > "$ART_DIR/.env"
 
-      sudo rm -f "$OUT_ZIP"
-      ( cd "$ART_DIR" && zip -r "$(basename "$OUT_ZIP")" "$(basename "$LOG")" ".env" >/dev/null 2>&1 || true )
-      ok "Diff restore completed"
-      echo "$OUT_ZIP"
+        sudo rm -f "$OUT_ZIP"
+        ( cd "$ART_DIR" && zip -r "$(basename "$OUT_ZIP")" "$(basename "$LOG")" ".env" >/dev/null 2>&1 || true )
+        ok "Diff restore completed"
+        echo "$OUT_ZIP"
+      }
+
+      # ── 후보 결정 파이프라인 ────────────────────────────
+      choose_target() {
+        TARGET=""; RESOLVED_BY=""
+        resolve_by_name     && return 0
+        resolve_by_version  && return 0
+        resolve_by_diffbase && return 0
+        resolve_by_list     && return 0
+        fail "no rollback target could be resolved"
+      }
+
+      # ── main ────────────────────────────────────────────
+      main() {
+        require_envs
+        ensure_tools
+        setup_context
+        get_current_live
+        collect_candidates
+        choose_target
+        switch_live
+        apply_tomcat
+        healthcheck
+        mark_bad_if_needed
+        update_live_pointer
+        package_artifacts
+      }
+      main "$@"
+
     REMOTE_SH
 
       log "▶ Executing diff restore via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
@@ -2082,95 +2262,189 @@
       log "Created temporary symlink deploy script: $remote_script"
 
       cat > "$remote_script" <<'REMOTE_SH'
-      set -eu
+      #!/usr/bin/env bash
+      set -euo pipefail
+      IFS=$'\n\t'
 
-      # BAD marker defaults
-      BAD_MARKER_NAME="${BAD_MARKER_NAME:-.bad}"
-      MARK_BAD_ON_ROLLBACK="${MARK_BAD_ON_ROLLBACK:-true}"
-
+      # ── 유틸 ─────────────────────────────────────────────
       log()  { printf '[INFO] %s\n' "$*"; }
       ok()   { printf '[OK]   %s\n' "$*"; }
       fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
       need() { command -v "$1" >/dev/null 2>&1; }
-      timestamp() { date +%Y%m%d%H%M%S; }
-      is_link() { sudo test -L "$1"; }   # 심볼릭 링크인가?
-      is_dir()  { sudo test -d "$1"; }   # 디렉터리인가?
-      is_any()  { sudo test -e "$1" -o -L "$1"; }  # 어떤 엔트리든 존재하나? (링크 포함)
+      ts()   { date +%Y%m%d%H%M%S; }
 
-      # ── 필수 env ─────────────────────────────────────
-      : "${REMOTE_DIR:?}"
-      : "${RELEASE_REPO_URL:?}"
-      : "${GROUP_ID:?}"
-      : "${ARTIFACT_ID:?}"
-      : "${COMMIT_TAG:?}"
-      : "${WAS_URL:?}"
-      : "${NEXUS_USER:?}"
-      : "${NEXUS_PASS:?}"
-      : "${CONTEXT_PATH:?}"
-      : "${WEBAPPS_ROOT:?}"
-      : "${RELEASES_BASE:?}"
-      : "${TOMCAT_SERVICE:?}"
-      : "${KEEP_RELEASES:?}"
+      # sudo 기반 탐지 (권한 문제 회피)
+      is_link() { sudo test -L "$1"; }                 # 심링크?
+      is_dir()  { sudo test -d "$1"; }                 # 디렉터리?
+      is_any()  { sudo test -e "$1" || sudo test -L "$1"; } # 어떤 엔트리든 존재?
 
-      : "${HEALTH_MODE:?}"
-      : "${HC_TIMEOUT:?}"
-      : "${HC_INTERVAL:?}"
-      : "${HEALTH_URL_OVERRIDE:-}"
+      # ── ENV 검증/기본값 ─────────────────────────────────
+      require_env() {
+        : "${REMOTE_DIR:?REMOTE_DIR is required}"
+        : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+        : "${GROUP_ID:?GROUP_ID is required}"
+        : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+        : "${COMMIT_TAG:?COMMIT_TAG is required}"
+        : "${WAS_URL:?WAS_URL is required}"
+        : "${NEXUS_USER:?NEXUS_USER is required}"
+        : "${NEXUS_PASS:?NEXUS_PASS is required}"
+        : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+        : "${WEBAPPS_ROOT:?WEBAPPS_ROOT is required}"
+        : "${RELEASES_BASE:?RELEASES_BASE is required}"
+        : "${TOMCAT_SERVICE:?TOMCAT_SERVICE is required}"
+        : "${KEEP_RELEASES:?KEEP_RELEASES is required}"
 
-      : "${HOT_RELOAD:?}"
-      : "${DEPLOY_USER:-}"
-      : "${DEPLOY_PASS:-}"
+        : "${HEALTH_MODE:=actuator}"      # actuator|page|none
+        : "${HEALTH_URL_OVERRIDE:=}"      # 지정 시 최우선
+        : "${HC_TIMEOUT:=60}"
+        : "${HC_INTERVAL:=2}"
 
-      : "${DEPLOY_LOG_NAME:?}"
+        : "${HOT_RELOAD:=false}"
+        : "${DEPLOY_USER:=}"
+        : "${DEPLOY_PASS:=}"
 
-      APP_NAME="$(printf "%s" "${CONTEXT_PATH#/}")"     # "/devops" → "devops"
-      LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
-      LIVE_LINK="${LIVE_LINK%/}"
-      APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
+        : "${DEPLOY_LOG_NAME:=symlink-deploy.log}"
+        : "${BAD_MARKER_NAME:=.bad}"
+        : "${MARK_BAD_ON_ROLLBACK:=true}"
 
-      ART_DIR="$REMOTE_DIR/artifacts"
-      LOG="$ART_DIR/$DEPLOY_LOG_NAME"
-      OUT_ZIP="$ART_DIR/symlink-deploy-artifacts.zip"
-      sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
-      : > "$LOG"
+        APP_NAME="${CONTEXT_PATH#/}"                       # "/devops" → "devops"
+        LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
+        APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
+        ART_DIR="$REMOTE_DIR/artifacts"
+        LOG="$ART_DIR/$DEPLOY_LOG_NAME"
+        OUT_ZIP="$ART_DIR/symlink-deploy-artifacts.zip"
 
-      # 도구 보장
-      for t in curl unzip zip ln readlink; do
-        if ! need "$t"; then
-          if   need apk; then sudo apk add --no-cache "$t" || true
-          elif need apt-get; then sudo apt-get update -y && sudo apt-get install -y "$t" || true
-          elif need dnf; then sudo dnf install -y "$t" || true
+        NEW_VERSION="${COMMIT_TAG#v}"
+        BASE_URL="${RELEASE_REPO_URL%/}/${GROUP_ID//.//}/${ARTIFACT_ID}"
+        NEW_WAR="${ARTIFACT_ID}-${NEW_VERSION}.war"
+        NEW_URL="${BASE_URL}/${NEW_VERSION}/${NEW_WAR}"
+
+        sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
+        # 로그 파일 생성/초기화도 sudo로
+        sudo sh -c ": > \"$LOG\""
+      }
+
+      # ── 도구 보장 ───────────────────────────────────────
+      ensure_tools() {
+        local pkgs=(curl unzip zip ln readlink)
+
+        for t in "${pkgs[@]}"; do
+          if ! need "$t"; then
+            if   need apk; then
+              sudo apk add --no-cache "$t" || true
+            elif need apt-get; then
+              sudo apt-get update -y || true
+              sudo apt-get install -y "$t" || true
+            elif need dnf; then
+              sudo dnf install -y "$t" || true
+            elif need yum; then
+              sudo yum install -y "$t" || true
+            elif need zypper; then
+              sudo zypper --non-interactive install "$t" || true
+            else
+              log "WARN: unknown package manager; cannot auto-install '$t'"
+            fi
           fi
+        done
+
+        # 최종 확인
+        for t in "${pkgs[@]}"; do
+          need "$t" || fail "'$t' not available"
+        done
+      }
+
+      # ── NEW(=새 릴리스) 준비 ────────────────────────────
+      prepare_new_version() {
+        new_dir="${APP_RELEASES_DIR}/${APP_NAME}-${NEW_VERSION}"
+        tmp_dir="${new_dir}.tmp.$$"
+
+        log "Download NEW: $NEW_URL"
+        sudo mkdir -p "$tmp_dir"
+        sudo curl -fsS -u "$NEXUS_USER:$NEXUS_PASS" -o "$tmp_dir/$NEW_WAR" "$NEW_URL" | sudo tee -a "$LOG" >/dev/null || true
+
+        sudo unzip -q "$tmp_dir/$NEW_WAR" -d "$tmp_dir/unzip"
+        sudo test -d "$tmp_dir/unzip/WEB-INF" || fail "WAR structure invalid (no WEB-INF)"
+
+        sudo rm -rf "$new_dir"
+        sudo mv "$tmp_dir/unzip" "$new_dir"
+        sudo rm -rf "$tmp_dir" || true
+
+        printf 'NEW_VERSION=%s\n' "$NEW_VERSION" | sudo tee -a "$LOG" >/dev/null
+        printf 'NEW_DIR=%s\n' "$new_dir" | sudo tee -a "$LOG" >/dev/null
+      }
+
+      # ── 기존 LIVE → 릴리스로 1회 이관(최초 배포 포함) ─────────
+      migrate_live_once() {
+        prev_target=""
+
+        log "MIGRATE: probe $(sudo ls -ld "$LIVE_LINK" 2>/dev/null || echo '<not-found>')"
+
+        if is_link "$LIVE_LINK"; then
+          prev_target="$(sudo readlink -f "$LIVE_LINK" 2>/dev/null || true)"
+          log "MIGRATE: already symlink -> ${prev_target:-<broken>}"
+          return 0
         fi
-      done
-      need curl || fail "curl not available"
-      need unzip || fail "unzip not available"
-      need zip  || fail "zip not available"
-      need ln   || fail "ln not available"
-      need readlink || fail "readlink not available"
 
-      # 버전/URL
-      NEW_VERSION="${COMMIT_TAG#v}"
-      BASE="${RELEASE_REPO_URL%/}/${GROUP_ID//.//}/${ARTIFACT_ID}"
-      NEW_WAR="${ARTIFACT_ID}-${NEW_VERSION}.war"
-      NEW_URL="${BASE}/${NEW_VERSION}/${NEW_WAR}"
+        if is_dir "$LIVE_LINK"; then
+          local legacy="${APP_RELEASES_DIR}/${APP_NAME}-legacy-$(ts)"
+          log "MIGRATE: moving DIR to legacy: $legacy"
+          sudo mv "$LIVE_LINK" "$legacy"
+          prev_target="$legacy"
+        elif is_any "$LIVE_LINK"; then
+          local legacy="${APP_RELEASES_DIR}/${APP_NAME}-legacy-$(ts).file"
+          log "MIGRATE: moving FILE to legacy: $legacy"
+          sudo mv "$LIVE_LINK" "$legacy"
+        else
+          log "MIGRATE: nothing to move (first deploy likely)"
+        fi
+      }
 
-      # 새 버전 작업 디렉터리
-      tmp_dir="${APP_RELEASES_DIR}/${APP_NAME}-${NEW_VERSION}.tmp.$$"
-      new_dir="${APP_RELEASES_DIR}/${APP_NAME}-${NEW_VERSION}"
+      # ── 심링크 전환 ─────────────────────────────────────
+      ln_s_safe() {
+        local tgt="$1" link="$2"
+        link="${link%/}"
+        sudo ln -sT "$tgt" "$link" 2>/dev/null || sudo ln -s "$tgt" "$link"
+      }
+      set_live_symlink() {
+        local target_dir="$1"
+        local tmp_link="${LIVE_LINK}.new.$(ts)"
+        ln_s_safe "$target_dir" "$tmp_link"
+        sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || { sudo rm -rf --one-file-system "$LIVE_LINK"; sudo mv "$tmp_link" "$LIVE_LINK"; }
+        log "LIVE -> $target_dir"
+      }
 
-      # 현재 타깃(이전)
-      prev_target=""
-      if [ -L "$LIVE_LINK" ]; then
-        prev_target="$(sudo readlink -f "$LIVE_LINK" || true)"
-      fi
-      echo "NEW_VERSION=$NEW_VERSION" | tee -a "$LOG"
-      [ -n "$prev_target" ] && echo "PREV_TARGET=$prev_target" | tee -a "$LOG" || true
+      # ── 서비스 갱신 ────────────────────────────────────
+      tomcat_reload_or_restart() {
+        if [ "${HOT_RELOAD}" = "true" ] && [ -n "${DEPLOY_USER}" ] && [ -n "${DEPLOY_PASS}" ] && need curl; then
+          curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://${WAS_URL}/manager/text/reload?path=/${APP_NAME}" | sudo tee -a "$LOG" >/dev/null || true
+          log "Tomcat manager reload attempted"
+          return 0
+        fi
+        if need systemctl; then
+          if sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null; then
+            log "Tomcat reload ok"; return 0
+          fi
+          log "Reload unsupported → restart"
+          sudo systemctl restart "$TOMCAT_SERVICE"
+          log "Tomcat restart ok"
+        fi
+      }
 
-      # 헬스 대기 함수
+      # ── 헬스체크 (URL 생성/대기) ─────────────────────────
+      health_url_build() {
+        if [ -n "$HEALTH_URL_OVERRIDE" ]; then
+          printf '%s\n' "$HEALTH_URL_OVERRIDE"; return
+        fi
+        case "$HEALTH_MODE" in
+          actuator) printf 'http://127.0.0.1:8080/%s/actuator/health\n' "$APP_NAME" ;;
+          page)     printf 'http://127.0.0.1:8080/%s/\n' "$APP_NAME" ;;
+          none)     printf '\n' ;;
+          *)        printf 'http://127.0.0.1:8080/%s/actuator/health\n' "$APP_NAME" ;;
+        esac
+      }
+
       health_wait() {
-        url="$1" timeout="$2" interval="$3"
-        elapsed=0
+        local url="$1" timeout="$2" interval="$3" elapsed=0
         while [ "$elapsed" -lt "$timeout" ]; do
           if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
             log "Health OK: $url"
@@ -2182,151 +2456,166 @@
         return 1
       }
 
-      # Tomcat reload/restart
-      tomcat_reload_or_restart() {
-        if command -v systemctl >/dev/null 2>&1; then
-          if sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null; then
-            log "Tomcat reload ok"
-            return 0
-          fi
-          log "Reload unsupported → restart"
-          sudo systemctl restart "$TOMCAT_SERVICE"
-          log "Tomcat restart ok"
-        fi
-      }
+      # ── live-pointer 기록/활용 ──────────────────────────
+      ensure_logs_dir() { sudo mkdir -p "$1/_logs"; }
 
-      ln_s_safe() {
-        local tgt="$1" link="$2"
-        link="${link%/}"
-        sudo ln -sT "$tgt" "$link" 2>/dev/null || sudo ln -s "$tgt" "$link"
-      }
+      write_live_pointer() {
+        ## $1=current_release_dir, $2=prev_release_dir
+        local current="$1" prev="${2:-}"
 
-      migrate_live_once() {
-        local releases_base_dir="$1"
-        sudo mkdir -p "$releases_base_dir"
-
-        # 진단 로그(권한 이슈 회피 위해 sudo 사용)
-        log "MIGRATE: WEBAPPS_ROOT=$WEBAPPS_ROOT APP_NAME=$APP_NAME"
-        log "MIGRATE: LIVE_LINK=$LIVE_LINK"
-        log "MIGRATE: probe: $(sudo ls -ld "$LIVE_LINK" 2>/dev/null || echo '<not-found-or-no-perm>')"
-
-        if is_link "$LIVE_LINK"; then
-          log "MIGRATE: skip (already symlink) -> $(sudo readlink -f "$LIVE_LINK" 2>/dev/null || echo '<broken>')"
+        # PREV 유효할 때만 기록 (sudo로 검사)
+        if [ -z "$prev" ] || ! sudo test -d "$prev"; then
+          log "live-pointer: skip write (no valid PREV)"
           return 0
         fi
 
-        if is_dir "$LIVE_LINK"; then
-          local legacy="${releases_base_dir}/${APP_NAME}-legacy-$(timestamp)"
-          log "MIGRATE: moving existing DIR to legacy: $legacy"
-          sudo mv "$LIVE_LINK" "$legacy"
-          prev_target="$legacy"
-          log "MIGRATE: moved dir -> $(sudo ls -ld "$legacy")"
-        elif is_any "$LIVE_LINK"; then
-          local legacy="${releases_base_dir}/${APP_NAME}-legacy-$(timestamp).file"
-          log "MIGRATE: moving existing FILE to legacy: $legacy"
-          sudo mv "$LIVE_LINK" "$legacy"
-          log "MIGRATE: moved file -> $(sudo ls -l "$legacy")"
-        else
-          log "MIGRATE: nothing to move (not found / no perm)"
-        fi
+        ensure_logs_dir "$current"
+
+        sudo sh -c \
+          "printf 'CURRENT=%s\nPREV=%s\n' \
+            \"\$(readlink -f \"$current\" 2>/dev/null || echo \"$current\")\" \
+            \"\$(readlink -f \"$prev\" 2>/dev/null || echo '')\" \
+            > \"$current/_logs/live-pointer.env\""
+
+        log "live-pointer.env updated (CURRENT=$(sudo readlink -f "$current" 2>/dev/null || echo "$current"), PREV=$(sudo readlink -f "$prev" 2>/dev/null || echo "$prev"))"
       }
 
-      set_live_symlink() {
-        local target_version_dir="$1"
-        local tmp_link="${LIVE_LINK}.new.$(timestamp)"
+      # 안전한 롤백 후보 탐색
+      resolve_prev_for_rollback() {
+        local new="$1" prev_hint="${2:-}"
+        local live_real="" prev="" rels=() i idx=-1 cand=""
 
-        # tmp 링크 생성
-        ln_s_safe "$target_version_dir" "$tmp_link"
-        # mv -Tf (GNU) → 실패 시 rm && mv 폴백
-        sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || {
-          sudo rm -rf --one-file-system "$LIVE_LINK"
-          sudo mv "$tmp_link" "$LIVE_LINK"
-        }
-        log "LIVE -> $target_version_dir"
-      }
+        live_real="$(sudo readlink -f "$LIVE_LINK" 2>/dev/null || true)"
 
-      # 새 버전 준비 (다운로드 → unzip → 소유/권한은 운영 정책에 맞게 별도 처리 가능)
-      sudo mkdir -p "$tmp_dir"
-      log "Download NEW: $NEW_URL"
-      sudo curl -fsS -u "$NEXUS_USER:$NEXUS_PASS" -o "$tmp_dir/$NEW_WAR" "$NEW_URL" >>"$LOG" 2>&1 || fail "download failed"
-      sudo unzip -q "$tmp_dir/$NEW_WAR" -d "$tmp_dir/unzip"
-      [ -d "$tmp_dir/unzip/WEB-INF" ] || fail "WAR structure invalid (no WEB-INF)"
-      sudo mv "$tmp_dir/unzip" "$new_dir"
-      sudo rm -rf "$tmp_dir" || true
-
-      # LIVE 마이그레이션 + 심링크 전환
-      # 1) 최초 1회: LIVE_LINK가 '링크가 아닌' 디렉터리/파일이면 releases 베이스로 legacy 이동만 수행
-      migrate_live_once "$APP_RELEASES_DIR"     # 예: /opt/tomcat/releases/devops
-      # 2) 새 버전 디렉터리를 가리키도록 LIVE 링크 전환 (원자적 교체)
-      set_live_symlink "$new_dir"               # 예: /opt/tomcat/releases/devops/devops-20.0.6
-
-      # 서비스 갱신
-      if [ "$HOT_RELOAD" = "true" ] && [ -n "$DEPLOY_USER" ] && [ -n "$DEPLOY_PASS" ] && command -v curl >/dev/null 2>&1; then
-        curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" >>"$LOG" 2>&1 || true
-      else
-        tomcat_reload_or_restart
-      fi
-
-      # 헬스체크
-      hc_url=""
-      if [ -n "$HEALTH_URL_OVERRIDE" ]; then
-        hc_url="$HEALTH_URL_OVERRIDE"
-      else
-        case "$HEALTH_MODE" in
-          actuator) hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
-          page)     hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
-          none)     hc_url="" ;;
-          *)        hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
-        esac
-      fi
-
-      if [ -n "$hc_url" ]; then
-        log "Health wait: $hc_url (timeout=${HC_TIMEOUT}s, mode=${HEALTH_MODE})"
-        if ! health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL"; then
-          echo "[WARN] Health failed → rollback to previous" | tee -a "$LOG"
-
-          # mark BAD on the failed new_dir before rollback completes
-          if [ "$MARK_BAD_ON_ROLLBACK" = "true" ]; then
-            sudo sh -c "printf 'marked bad on %s\n' \"$(date -Ins)\" > '$new_dir/$BAD_MARKER_NAME'"
-          fi
-
-          if [ -n "$prev_target" ] && [ -d "$prev_target" ]; then
-            set_live_symlink "$prev_target"
-            tomcat_reload_or_restart
-            health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL" || true
-            fail "Deploy failed. Rolled back to: $prev_target"
-          else
-            fail "Deploy failed and no previous target to rollback"
+        # 1) 현재 LIVE의 live-pointer.env
+        if [ -n "$live_real" ] && sudo test -f "$live_real/_logs/live-pointer.env"; then
+          prev="$(sudo awk -F= '/^PREV=/{print $2}' "$live_real/_logs/live-pointer.env" | tr -d '\r')"
+          if [ -n "$prev" ] && sudo test -d "$prev" && ! sudo test -f "$prev/$BAD_MARKER_NAME"; then
+            printf '%s\n' "$prev"; return 0
           fi
         fi
-      else
-        log "Health check skipped"
-      fi
 
-      # 보관정책: 최신 N개 유지
-      if command -v ls >/dev/null 2>&1; then
-        mapfile -t rels < <(ls -1dt "${APP_RELEASES_DIR}/${APP_NAME}-"* 2>/dev/null || true)
-        if [ "${#rels[@]}" -gt "$KEEP_RELEASES" ]; then
-          for ((i=KEEP_RELEASES; i<${#rels[@]}; i++)); do
-            [ "${rels[$i]}" = "$prev_target" ] && continue
-            log "Keep-policy: remove ${rels[$i]}"
-            sudo rm -rf --one-file-system "${rels[$i]}" || true
+        # 2) prev_hint (배포 직전 LIVE)
+        if [ -n "$prev_hint" ] && sudo test -d "$prev_hint" && ! sudo test -f "$prev_hint/$BAD_MARKER_NAME"; then
+          printf '%s\n' "$prev_hint"; return 0
+        fi
+
+        # 3) 릴리스 목록에서 new의 바로 이전(older sibling)
+        mapfile -t rels < <(sudo ls -1dt "${APP_RELEASES_DIR}/${APP_NAME}-"* 2>/dev/null || true)
+
+        # new 위치
+        for i in "${!rels[@]}"; do
+          if [ "$(sudo readlink -f "${rels[$i]}" 2>/dev/null || echo "${rels[$i]}")" = "$(sudo readlink -f "$new" 2>/dev/null || echo "$new")" ]; then
+            idx="$i"; break
+          fi
+        done
+        # 없으면 live_real 기준
+        if [ "$idx" -lt 0 ] && [ -n "$live_real" ]; then
+          for i in "${!rels[@]}"; do
+            if [ "$(sudo readlink -f "${rels[$i]}" 2>/dev/null || echo "${rels[$i]}")" = "$live_real" ]; then
+              idx="$i"; break
+            fi
           done
         fi
-      fi
 
-      # 산출물 구성
-      {
-        echo "CHANGED=1"
-        echo "NEW_DIR=$new_dir"
-        echo "PREV_DIR=${prev_target:-}"
-        echo "LIVE_LINK=$LIVE_LINK"
-      } > "$ART_DIR/.env"
+        if [ "$idx" -ge 0 ]; then
+          for (( i=idx+1; i<${#rels[@]}; i++ )); do
+            cand="${rels[$i]}"
+            # 자기 자신/현재 LIVE 제외
+            [ "$(sudo readlink -f "$cand" 2>/dev/null || echo "$cand")" = "$(sudo readlink -f "$new" 2>/dev/null || echo "$new")" ] && continue
+            [ -n "$live_real" ] && [ "$(sudo readlink -f "$cand" 2>/dev/null || echo "$cand")" = "$live_real" ] && continue
+            # 유효성 및 .bad 제외
+            sudo test -d "$cand" || continue
+            sudo test -f "$cand/$BAD_MARKER_NAME" && continue
+            printf '%s\n' "$cand"; return 0
+          done
+        fi
 
-      rm -f "$OUT_ZIP"
-      zip -r "$OUT_ZIP" "$LOG" "$ART_DIR/.env" >/dev/null 2>&1 || true
-      ok "Symlink deploy completed"
-      echo "$OUT_ZIP"
+        return 1
+      }
+
+      # ── 헬스체크 후 실패 시 롤백 ─────────────────────────
+      healthcheck_or_rollback() {
+        local hc_url="$1" new="$2" prev_hint="${3:-}"
+
+        if [ -z "$hc_url" ]; then
+          log "Health check skipped (mode=none)"; return 0
+        fi
+
+        log "Health wait: $hc_url (timeout=${HC_TIMEOUT}s, mode=${HEALTH_MODE})"
+        if health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL"; then
+          return 0
+        fi
+
+        echo "[WARN] Health failed → rollback procedure" | sudo tee -a "$LOG" >/dev/null
+
+        # 실패 마킹(옵션)
+        if [ "$MARK_BAD_ON_ROLLBACK" = "true" ]; then
+          sudo sh -c "printf 'marked bad on %s\n' \"$(date -Ins)\" > '$new/$BAD_MARKER_NAME'"
+        fi
+
+        # 안전한 순서로 롤백 대상 탐색
+        local prev=""
+        if prev="$(resolve_prev_for_rollback "$new" "$prev_hint")"; then
+          set_live_symlink "$prev"
+          tomcat_reload_or_restart
+          health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL" || true
+          fail "Deploy failed. Rolled back to: $prev"
+        fi
+
+        fail "Deploy failed and no previous target to rollback"
+      }
+
+      # ── 보존 정책 ───────────────────────────────────────
+      prune_releases() {
+        mapfile -t rels < <(sudo ls -1dt "${APP_RELEASES_DIR}/${APP_NAME}-"* 2>/dev/null || true)
+        [ "${#rels[@]}" -le "$KEEP_RELEASES" ] && { log "Keep-policy: nothing to prune"; return 0; }
+
+        for ((i=KEEP_RELEASES; i<${#rels[@]}; i++)); do
+          [ -n "${new_dir:-}" ]     && [ "$(sudo readlink -f "${rels[$i]}" 2>/dev/null || echo x)" = "$(sudo readlink -f "$new_dir" 2>/dev/null || echo y)" ] && continue
+          [ -n "${prev_target:-}" ] && [ "$(sudo readlink -f "${rels[$i]}" 2>/dev/null || echo x)" = "$(sudo readlink -f "$prev_target" 2>/dev/null || echo y)" ] && continue
+          base="$(basename "${rels[$i]}")"
+          [[ "$base" == "${APP_NAME}-legacy-"* ]] && continue  # 최초 이관 백업 보호
+          log "Keep-policy: remove ${rels[$i]}"
+          sudo rm -rf --one-file-system "${rels[$i]}" || true
+        done
+      }
+
+      # ── 산출물 ZIP ─────────────────────────────────────
+      package_artifacts() {
+        # .env 생성
+        sudo sh -c "printf 'NEW_VERSION=%s\nNEW_DIR=%s\nPREV_DIR=%s\nLIVE_LINK=%s\n' \
+          \"$NEW_VERSION\" \"$new_dir\" \"${prev_target:-}\" \"$LIVE_LINK\" > \"$ART_DIR/.env\""
+
+        # zip 생성
+        sudo sh -c "(cd \"$ART_DIR\" && zip -r \"$(basename "$OUT_ZIP")\" \"$(basename "$LOG")\" .env >/dev/null 2>&1) || true"
+
+        ok "Artifacts packaged: $OUT_ZIP"
+        echo "$OUT_ZIP"
+      }
+
+      # ── 메인 ───────────────────────────────────────────
+      main() {
+        require_env
+        ensure_tools
+
+        prepare_new_version           # 새 릴리스 디렉터리 생성
+        migrate_live_once             # 기존 LIVE 이관/탐지 (최초 배포면 prev_target 없음)
+        set_live_symlink "$new_dir"   # LIVE → 새 버전 전환
+        tomcat_reload_or_restart
+
+        hc_url="$(health_url_build)"
+        healthcheck_or_rollback "$hc_url" "$new_dir" "${prev_target:-}"  # 실패 시 내부에서 롤백/종료
+
+        # 헬스 성공 시: 두 번째 배포부터 live-pointer 기록 (조건은 함수 내부에 포함)
+        write_live_pointer "$new_dir" "${prev_target:-}"
+
+        prune_releases
+        package_artifacts             # 마지막 줄에 ZIP 경로 echo
+      }
+
+      main "$@"
+
     REMOTE_SH
 
       # ── 원격 실행 ─────────────────────────────────────
@@ -2369,7 +2658,7 @@
       ok "Symlink deploy finished"
     }
 
-
+ 
 # ────────────────────────────────────────────────
 # 함수: fn_tomcat_symbolic_restore
 #
@@ -2494,32 +2783,107 @@
       log "Created temporary symlink rollback script: $remote_script"
 
       cat > "$remote_script" <<'REMOTE_SH'
-      set -eu
+      #!/usr/bin/env bash
+      set -euo pipefail
+      IFS=$'\n\t'
 
-      # BAD marker defaults
-      BAD_MARKER_NAME="${BAD_MARKER_NAME:-.bad}"
-      MARK_BAD_ON_ROLLBACK="${MARK_BAD_ON_ROLLBACK:-true}"
-
-      # ── 로컬 유틸 ─────────────────────────────────────
+      # ──────────────────────────────────────────────────────────────
+      # 유틸리티
+      # ──────────────────────────────────────────────────────────────
       log()  { printf '[INFO] %s\n' "$*"; }
       ok()   { printf '[OK]   %s\n' "$*"; }
       fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
       need() { command -v "$1" >/dev/null 2>&1; }
-      timestamp() { date +%Y%m%d%H%M%S; }
-      is_link() { sudo test -L "$1"; }
-      is_dir()  { sudo test -d "$1"; }
-      is_any()  { sudo test -e "$1" -o -L "$1"; }
+      ts()   { date +%Y%m%d%H%M%S; }
 
+      # sudo 기반 테스트(권한 문제 회피)
+      is_link() { sudo test -L "$1"; }                            # 심볼릭 링크인가?
+      is_dir()  { sudo test -d "$1"; }                            # 디렉터리인가?
+      is_any()  { sudo test -e "$1" || sudo test -L "$1"; }       # 어떤 엔트리든 존재하는가?
+
+      # ──────────────────────────────────────────────────────────────
+      # 환경 변수 검증 및 기본값 설정
+      # ──────────────────────────────────────────────────────────────
+      require_env() {
+        : "${CONTEXT_PATH:?CONTEXT_PATH 필요(예: /myapp)}"
+        : "${WEBAPPS_ROOT:?WEBAPPS_ROOT 필요(예: /opt/tomcat/webapps)}"
+        : "${RELEASES_BASE:?RELEASES_BASE 필요(예: /opt/tomcat/releases)}"
+        : "${TOMCAT_SERVICE:?TOMCAT_SERVICE 필요(예: tomcat)}"
+
+        : "${REMOTE_DIR:?REMOTE_DIR 필요(예: /var/tmp/deploy)}"
+        : "${RESTORE_LOG_NAME:=symlink-rollback.log}"   # 출력 로그 파일명
+
+        : "${HEALTH_MODE:=actuator}"                    # actuator|page|none
+        : "${HEALTH_URL_OVERRIDE:=}"
+        : "${HC_TIMEOUT:=60}"
+        : "${HC_INTERVAL:=2}"
+        : "${WAS_URL:?WAS_URL 필요(host:port)}"
+
+        : "${HOT_RELOAD:=false}"                        # Tomcat manager reload 사용 여부
+        : "${DEPLOY_USER:=}"                            # manager reload 계정
+        : "${DEPLOY_PASS:=}"
+
+        : "${ROLLBACK_TO_VERSION:=}"                    # 명시적 버전 롤백 시 사용(선택)
+        : "${BAD_MARKER_NAME:=.bad}"                    # 불량 마커 파일명
+        : "${MARK_BAD_ON_ROLLBACK:=true}"               # 롤백 성공 후 이전 CURRENT에 bad 마커 남길지
+
+        APP_NAME="${CONTEXT_PATH#/}"                    # "/myapp" → "myapp"
+        LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
+        APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
+
+        ART_DIR="${REMOTE_DIR%/}/artifacts"
+        LOG="$ART_DIR/$RESTORE_LOG_NAME"
+        OUT_ZIP="$ART_DIR/symlink-rollback-artifacts.zip"
+
+        sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
+        # 로그 파일 초기화(root 소유여도 무방)
+        sudo sh -c ": > \"$LOG\""
+      }
+
+      # ──────────────────────────────────────────────────────────────
+      # 필요한 도구 확인(가능하면 설치) 및 최종 보증
+      # ──────────────────────────────────────────────────────────────
+      ensure_tools() {
+        local pkgs=(ln readlink zip ls curl awk)
+
+        for t in "${pkgs[@]}"; do
+          if ! need "$t"; then
+            if   need apk; then
+              sudo apk add --no-cache "$t" || true
+            elif need apt-get; then
+              sudo apt-get update -y || true
+              sudo apt-get install -y "$t" || true
+            elif need dnf; then
+              sudo dnf install -y "$t" || true
+            elif need yum; then
+              sudo yum install -y "$t" || true
+            elif need zypper; then
+              sudo zypper --non-interactive install "$t" || true
+            else
+              log "WARN: 패키지 매니저를 찾을 수 없어 '$t' 자동 설치 불가"
+            fi
+          fi
+        done
+
+        # 최종 확인(없으면 명확히 실패)
+        for t in "${pkgs[@]}"; do
+          need "$t" || fail "'$t' 사용 불가"
+        done
+      }
+
+      # ──────────────────────────────────────────────────────────────
+      # 심볼릭 링크 헬퍼
+      # ──────────────────────────────────────────────────────────────
       ln_s_safe() {
         local tgt="$1" link="$2"
         link="${link%/}"
         sudo ln -sT "$tgt" "$link" 2>/dev/null || sudo ln -s "$tgt" "$link"
       }
-
       set_live_symlink() {
         local target_dir="$1"
-        local tmp_link="${LIVE_LINK}.new.$(timestamp)"
+        local tmp_link="${LIVE_LINK}.new.$(ts)"
         ln_s_safe "$target_dir" "$tmp_link"
+        # 원자적 교체: mv -T(gnu) → 실패 시 수동 교체
         sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || {
           sudo rm -rf --one-file-system "$LIVE_LINK"
           sudo mv "$tmp_link" "$LIVE_LINK"
@@ -2527,56 +2891,71 @@
         log "LIVE -> $target_dir"
       }
 
+      # ──────────────────────────────────────────────────────────────
+      # 1회성 마이그레이션: LIVE가 심볼릭 링크가 아니면(디렉터리/파일) releases로 백업
+      # ──────────────────────────────────────────────────────────────
       migrate_live_once() {
-        # 배포 함수와 동일: LIVE가 '링크가 아닌' 엔트리면 releases로 이동(legacy)
         local releases_base_dir="$1"
         sudo mkdir -p "$releases_base_dir"
 
-        log "MIGRATE: WEBAPPS_ROOT=$WEBAPPS_ROOT APP_NAME=$APP_NAME"
-        log "MIGRATE: LIVE_LINK=$LIVE_LINK"
-        log "MIGRATE: probe: $(sudo ls -ld "$LIVE_LINK" 2>/dev/null || echo '<not-found-or-no-perm>')"
+        log "MIGRATE: probe $(sudo ls -ld "$LIVE_LINK" 2>/dev/null || echo '<not-found>')"
 
         if is_link "$LIVE_LINK"; then
-          log "MIGRATE: skip (already symlink) -> $(sudo readlink -f "$LIVE_LINK" 2>/dev/null || echo '<broken>')"
+          log "MIGRATE: 이미 심볼릭 링크 -> $(sudo readlink -f "$LIVE_LINK" 2>/dev/null || echo '<broken>')"
           return 0
         fi
 
         if is_dir "$LIVE_LINK"; then
-          local legacy="${releases_base_dir}/${APP_NAME}-legacy-$(timestamp)"
-          log "MIGRATE: moving existing DIR to legacy: $legacy"
+          local legacy="${releases_base_dir}/${APP_NAME}-legacy-$(ts)"
+          log "MIGRATE: LIVE 디렉터리를 legacy로 이동: $legacy"
           sudo mv "$LIVE_LINK" "$legacy"
-          log "MIGRATE: moved dir -> $(sudo ls -ld "$legacy")"
+          log "MIGRATE: 이동됨 -> $(sudo ls -ld "$legacy")"
         elif is_any "$LIVE_LINK"; then
-          local legacy="${releases_base_dir}/${APP_NAME}-legacy-$(timestamp).file"
-          log "MIGRATE: moving existing FILE to legacy: $legacy"
+          local legacy="${releases_base_dir}/${APP_NAME}-legacy-$(ts).file"
+          log "MIGRATE: LIVE 파일을 legacy로 이동: $legacy"
           sudo mv "$LIVE_LINK" "$legacy"
-          log "MIGRATE: moved file -> $(sudo ls -l "$legacy")"
+          log "MIGRATE: 이동됨 -> $(sudo ls -l "$legacy")"
         else
-          log "MIGRATE: nothing to move (not found / no perm)"
+          log "MIGRATE: 이동할 대상 없음(첫 심볼릭 전환 상황)"
         fi
       }
 
+      # ──────────────────────────────────────────────────────────────
+      # Tomcat reload/restart(Tomcat Manager reload 옵션 지원)
+      # ──────────────────────────────────────────────────────────────
       tomcat_reload_or_restart() {
         if [ "$HOT_RELOAD" = "true" ] && [ -n "$DEPLOY_USER" ] && [ -n "$DEPLOY_PASS" ] && need curl; then
-          # Tomcat Manager 핫리로드
-          curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" >>"$LOG" 2>&1 || true
-          log "Tomcat manager reload requested"
+          curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://${WAS_URL}/manager/text/reload?path=/${APP_NAME}" \
+            | sudo tee -a "$LOG" >/dev/null || true
+          log "Tomcat manager reload 요청 완료"
           return 0
         fi
         if need systemctl; then
           if sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null; then
-            log "Tomcat reload ok"
-            return 0
+            log "Tomcat reload 성공"; return 0
           fi
-          log "Reload unsupported → restart"
+          log "Reload 미지원 → restart 시도"
           sudo systemctl restart "$TOMCAT_SERVICE"
-          log "Tomcat restart ok"
+          log "Tomcat restart 성공"
         fi
       }
 
+      # ──────────────────────────────────────────────────────────────
+      # 헬스체크(URL 생성 + 대기)
+      # ──────────────────────────────────────────────────────────────
+      health_url_build() {
+        if [ -n "$HEALTH_URL_OVERRIDE" ]; then
+          printf '%s\n' "$HEALTH_URL_OVERRIDE"; return
+        fi
+        case "$HEALTH_MODE" in
+          actuator) printf 'http://127.0.0.1:8080/%s/actuator/health\n' "$APP_NAME" ;;
+          page)     printf 'http://127.0.0.1:8080/%s/\n' "$APP_NAME" ;;
+          none)     printf '\n' ;;
+          *)        printf 'http://127.0.0.1:8080/%s/actuator/health\n' "$APP_NAME" ;;
+        esac
+      }
       health_wait() {
-        url="$1" timeout="$2" interval="$3"
-        elapsed=0
+        local url="$1" timeout="$2" interval="$3" elapsed=0
         while [ "$elapsed" -lt "$timeout" ]; do
           if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
             log "Health OK: $url"
@@ -2588,180 +2967,198 @@
         return 1
       }
 
-      # ── 필수 env ─────────────────────────────────────
-      : "${CONTEXT_PATH:?}"
-      : "${WEBAPPS_ROOT:?}"
-      : "${RELEASES_BASE:?}"
-      : "${TOMCAT_SERVICE:?}"
-      : "${ROLLBACK_TO_VERSION:-}"
-      : "${HEALTH_MODE:?}"
-      : "${HEALTH_URL_OVERRIDE:-}"
-      : "${HC_TIMEOUT:?}"
-      : "${HC_INTERVAL:?}"
-      : "${REMOTE_DIR:?}"
-      : "${RESTORE_LOG_NAME:?}"
-      : "${HOT_RELOAD:?}"
-      : "${DEPLOY_USER:-}"
-      : "${DEPLOY_PASS:-}"
-      : "${WAS_URL:?}"
-
-      APP_NAME="$(printf "%s" "${CONTEXT_PATH#/}")"
-      LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
-      APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
-
-      ART_DIR="$REMOTE_DIR/artifacts"
-      LOG="$ART_DIR/$RESTORE_LOG_NAME"
-      OUT_ZIP="$ART_DIR/symlink-rollback-artifacts.zip"
-      sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
-      : > "$LOG"
-
-      # ── 도구 준비 ─────────────────────────────────────
-      for t in ln readlink zip ls curl; do
-        if ! need "$t"; then
-          if   need apk; then sudo apk add --no-cache "$t" || true
-          elif need apt-get; then sudo apt-get update -y && sudo apt-get install -y "$t" || true
-          elif need dnf; then sudo dnf install -y "$t" || true
+      # ──────────────────────────────────────────────────────────────
+      # live-pointer 헬퍼(CURRENT/PREV)
+      # ──────────────────────────────────────────────────────────────
+      read_live_pointer_prev() {
+        # CURRENT/_logs/live-pointer.env 에서 PREV 읽기
+        local current_real prev
+        current_real="$(sudo readlink -f "$LIVE_LINK" 2>/dev/null || true)"
+        if [ -z "$current_real" ]; then
+          return 1
+        fi
+        if sudo test -f "$current_real/_logs/live-pointer.env"; then
+          prev="$(sudo awk -F= '/^PREV=/{print $2}' "$current_real/_logs/live-pointer.env" | tr -d '\r')"
+          if [ -n "$prev" ] && sudo test -d "$prev"; then
+            printf '%s\n' "$prev"
+            return 0
           fi
         fi
-      done
-      need ln || fail "ln not available"
-      need readlink || fail "readlink not available"
-      need zip || fail "zip not available"
-      need ls  || fail "ls not available"
-      need curl || log "curl missing (health/manager reload may be limited)"
+        return 1
+      }
 
-      # ── 현재 링크/대상 후보 계산 ─────────────────────
-      current=""
-      if is_link "$LIVE_LINK"; then
-        current="$(sudo readlink -f "$LIVE_LINK" || true)"
-      fi
-      echo "CURRENT=$current" | tee -a "$LOG"
-
-      # LIVE가 심링크가 아니면(초기 전환 미수행 상태 등) 먼저 legacy로 이동시켜 심링크 체계로 통일
-      if ! is_link "$LIVE_LINK"; then
-        migrate_live_once "$APP_RELEASES_DIR"
-      fi
-
-      # 최신(수정시각 내림차순)으로 정렬된 후보 (BAD 마커가 있으면 제외)
-      mapfile -t rels < <(
-        ls -1dt "${APP_RELEASES_DIR}/${APP_NAME}-"* 2>/dev/null \
+      # ──────────────────────────────────────────────────────────────
+      # 후보 릴리스 목록 생성(최신순), .bad 제외
+      # ──────────────────────────────────────────────────────────────
+      list_candidates() {
+        # 최신 → 오래된 순서로 릴리스 디렉터리 출력, .bad 는 스킵
+        sudo ls -1dt "${APP_RELEASES_DIR}/${APP_NAME}-"* 2>/dev/null \
         | while read -r d; do
             if sudo test -f "$d/$BAD_MARKER_NAME"; then
               continue
             fi
             printf "%s\n" "$d"
           done
-      )
+      }
 
-      choose_prev() {
-        # rels: 최신순 (rels[0]가 가장 최신, legacy 포함)
-        [ "${#rels[@]}" -ge 1 ] || return 1
+      # ──────────────────────────────────────────────────────────────
+      # 롤백 대상 선택(안전 순서)
+      # 1) ROLLBACK_TO_VERSION 이 지정되면 그 버전 사용(존재 & .bad 아님)
+      # 2) live-pointer의 PREV 가 있으면 그 경로 사용
+      # 3) 그렇지 않으면 CURRENT의 "직전(older sibling)" 1개 선택
+      #    - CURRENT 자신 제외
+      #    - .bad 제외
+      # ──────────────────────────────────────────────────────────────
+      choose_target() {
+        local target="" current_real="" cand prev_hint="" rel
+        local -a rels=()
+        local i idx=-1
 
-        # current가 rels 안에 있으면 그 '다음(직전)'을 선택
-        if [ -n "$current" ]; then
-          local i=0
-          while [ $i -lt ${#rels[@]} ]; do
-            # 실경로 비교(심링크/바인드 마운트 대비)
-            if [ "$(sudo readlink -f "${rels[$i]}")" = "$current" ]; then
-              if [ $((i+1)) -lt ${#rels[@]} ]; then
-                printf "%s\n" "${rels[$((i+1))]}"
-                return 0
-              else
-                # current가 가장 오래된 항목이면 자기 자신 외엔 없음 → 그나마 current 반환
-                printf "%s\n" "${rels[$i]}"
-                return 0
-              fi
+        # 1) 명시적 버전 우선
+        if [ -n "$ROLLBACK_TO_VERSION" ]; then
+          cand="${APP_RELEASES_DIR}/${APP_NAME}-${ROLLBACK_TO_VERSION}"
+          if sudo test -d "$cand"; then
+            if ! sudo test -f "$cand/$BAD_MARKER_NAME"; then
+              printf '%s\n' "$cand"; return 0
+            else
+              fail "명시 대상에 BAD 마커 존재: $cand/$BAD_MARKER_NAME"
             fi
-            i=$((i+1))
+          else
+            fail "명시 대상 버전을 찾을 수 없음: $cand"
+          fi
+        fi
+
+        # LIVE가 심볼릭이 아니면 1회 마이그레이션
+        if ! is_link "$LIVE_LINK"; then
+          migrate_live_once "$APP_RELEASES_DIR"
+        fi
+
+        # CURRENT(실경로)
+        current_real="$(sudo readlink -f "$LIVE_LINK" 2>/dev/null || true)"
+        printf 'CURRENT=%s\n' "${current_real:-}" | sudo tee -a "$LOG" >/dev/null
+
+        # 2) live-pointer PREV 우선 시도
+        if prev_hint="$(read_live_pointer_prev)"; then
+          printf '%s\n' "$prev_hint"; return 0
+        fi
+
+        # 3) 후보 목록에서 CURRENT의 바로 이전 선택
+        mapfile -t rels < <(list_candidates)
+        # 후보가 하나도 없으면 실패
+        [ "${#rels[@]}" -gt 0 ] || return 1
+
+        # 후보 목록에서 CURRENT의 인덱스 찾기
+        if [ -n "$current_real" ]; then
+          for i in "${!rels[@]}"; do
+            if [ "$(sudo readlink -f "${rels[$i]}" 2>/dev/null || echo "${rels[$i]}")" = "$current_real" ]; then
+              idx="$i"; break
+            fi
           done
-          # current가 목록에 없으면 최신의 '직전'으로 롤백
-          if [ "${#rels[@]}" -ge 2 ]; then
-            printf "%s\n" "${rels[1]}"
-          else
-            printf "%s\n" "${rels[0]}"
-          fi
-        else
-          # current를 모르면: 최신의 '직전'을 우선 선택(진짜 롤백)
-          if [ "${#rels[@]}" -ge 2 ]; then
-            printf "%s\n" "${rels[1]}"
-          else
-            printf "%s\n" "${rels[0]}"
-          fi
         fi
-      }
 
-      # ROLLBACK_TO_VERSION 우선
-      target=""
-      if [ -n "$ROLLBACK_TO_VERSION" ]; then
-        cand="${APP_RELEASES_DIR}/${APP_NAME}-${ROLLBACK_TO_VERSION}"
-        if [ -d "$cand" ]; then
-          target="$cand"
-        else
-          fail "rollback target version not found: $cand"
+        # CURRENT를 찾았으면 그 다음(오래된 것) 반환
+        if [ "$idx" -ge 0 ]; then
+          for (( i=idx+1; i<${#rels[@]}; i++ )); do
+            rel="${rels[$i]}"
+            sudo test -d "$rel" || continue
+            printf '%s\n' "$rel"; return 0
+          done
+          # CURRENT가 가장 오래된 항목이라면 롤백 불가
+          return 1
         fi
-      else
-        target="$(choose_prev || true)"
-      fi
 
-      # 자기 자신으로의 롤백 방지: target이 current와 같으면 다음 후보를 찾아본다
-      if [ -n "$target" ] && [ -n "$current" ] && [ "$(sudo readlink -f "$target")" = "$current" ] && [ "${#rels[@]}" -ge 2 ]; then
-        # rels에서 current가 아닌 첫 번째 항목 선택
-        for cand in "${rels[@]}"; do
-          if [ "$(sudo readlink -f "$cand")" != "$current" ]; then
-            target="$cand"; break
-          fi
+        # CURRENT를 목록에서 못 찾은 경우(엣지): CURRENT와 다른 최신 후보 반환
+        for rel in "${rels[@]}"; do
+          [ -n "$current_real" ] && [ "$(sudo readlink -f "$rel" 2>/dev/null || echo "$rel")" = "$current_real" ] && continue
+          printf '%s\n' "$rel"; return 0
         done
-      fi
 
-      # 최종 검증
-      [ -n "$target" ] && [ -d "$target" ] || {
-        echo "AVAILABLE_RELEASES:" | tee -a "$LOG"
-        printf ' - %s\n' "${rels[@]}" | tee -a "$LOG" || true
-        fail "rollback target not resolvable"
+        return 1
       }
-      echo "TARGET=$target" | tee -a "$LOG"
 
-      # ── 전환 ─────────────────────────────────────────
-      set_live_symlink "$target"
+      # ──────────────────────────────────────────────────────────────
+      # 전환 후 헬스체크(wrapper)
+      # ──────────────────────────────────────────────────────────────
+      post_switch_health_or_fail() {
+        local hc_url
+        hc_url="$(health_url_build)"
+        if [ -z "$hc_url" ] || ! need curl; then
+          log "헬스체크 생략"
+          return 0
+        fi
+        log "헬스 대기: $hc_url (timeout=${HC_TIMEOUT}s, mode=${HEALTH_MODE})"
+        health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL" || fail "롤백 후 헬스 실패: $hc_url"
+      }
 
-      # ── 서비스 갱신 ───────────────────────────────────
-      tomcat_reload_or_restart
+      # ──────────────────────────────────────────────────────────────
+      # 이전 CURRENT에 BAD 마커 생성(롤백 성공 이후만)
+      # ──────────────────────────────────────────────────────────────
+      mark_previous_current_bad() {
+        local previous_current="$1"
+        if [ -n "$previous_current" ] && sudo test -d "$previous_current" && [ "$MARK_BAD_ON_ROLLBACK" = "true" ]; then
+          sudo sh -c "printf 'marked bad on %s\n' \"$(date -Ins)\" > '$previous_current/$BAD_MARKER_NAME'"
+        fi
+      }
 
-      # ── 헬스체크 ──────────────────────────────────────
-      hc_url=""
-      if [ -n "$HEALTH_URL_OVERRIDE" ]; then
-        hc_url="$HEALTH_URL_OVERRIDE"
-      else
-        case "$HEALTH_MODE" in
-          actuator) hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
-          page)     hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
-          none)     hc_url="" ;;
-          *)        hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
-        esac
-      fi
+      # ──────────────────────────────────────────────────────────────
+      # 산출물 패키징(zip)
+      # ──────────────────────────────────────────────────────────────
+      package_artifacts() {
+        local target="$1"
+        sudo sh -c "printf 'ROLLED_BACK_TO=%s\nLIVE_LINK=%s\n' \
+          \"$target\" \"$LIVE_LINK\" > \"$ART_DIR/.env\""
+        sudo sh -c "(cd \"$ART_DIR\" && zip -r \"$(basename "$OUT_ZIP")\" \"$(basename "$LOG")\" .env >/dev/null 2>&1) || true"
+        ok "Artifacts packaged: $OUT_ZIP"
+        echo "$OUT_ZIP"
+      }
 
-      if [ -n "$hc_url" ] && need curl; then
-        log "Health wait: $hc_url (timeout=${HC_TIMEOUT}s, mode=${HEALTH_MODE})"
-        health_wait "$hc_url" "$HC_TIMEOUT" "$HC_INTERVAL" || fail "rollback health failed: $hc_url"
-      else
-        log "Health check skipped"
-      fi
+      # ──────────────────────────────────────────────────────────────
+      # 메인
+      # ──────────────────────────────────────────────────────────────
+      main() {
+        require_env
+        ensure_tools
 
-      # BAD marker (only after successful rollback)
-      if [ -n "$current" ] && [ -d "$current" ] && [ "$MARK_BAD_ON_ROLLBACK" = "true" ]; then
-        sudo sh -c "printf 'marked bad on %s\n' \"$(date -Ins)\" > '$current/$BAD_MARKER_NAME'"
-      fi
+        # 전환 전 CURRENT 기록(디버그용)
+        local current_real=""
+        if is_link "$LIVE_LINK"; then
+          current_real="$(sudo readlink -f "$LIVE_LINK" 2>/dev/null || true)"
+        fi
+        printf 'CURRENT(before)=%s\n' "${current_real:-}" | sudo tee -a "$LOG" >/dev/null
 
-      # ── 산출물 ────────────────────────────────────────
-      {
-        echo "ROLLED_BACK_TO=$target"
-        echo "LIVE_LINK=$LIVE_LINK"
-      } > "$ART_DIR/.env"
+        # 롤백 대상 결정
+        local target=""
+        if ! target="$(choose_target)"; then
+          # 디버그를 위해 사용 가능한 릴리스 나열
+          echo "AVAILABLE_RELEASES:" | sudo tee -a "$LOG" >/dev/null
+          list_candidates | sed 's/^/ - /' | sudo tee -a "$LOG" >/dev/null || true
+          fail "롤백 대상을 결정할 수 없습니다"
+        fi
+        printf 'TARGET=%s\n' "$target" | sudo tee -a "$LOG" >/dev/null
 
-      sudo rm -f "$OUT_ZIP"
-      zip -r "$OUT_ZIP" "$LOG" "$ART_DIR/.env" >/dev/null 2>&1 || true
-      ok "Symlink rollback completed"
-      echo "$OUT_ZIP"
+        # LIVE → target 전환
+        set_live_symlink "$target"
+
+        # Tomcat reload/restart 적용
+        tomcat_reload_or_restart
+
+        # 헬스체크(설정된 경우)
+        post_switch_health_or_fail
+
+        # 롤백 성공 후 이전 CURRENT에 BAD 마커 표시(옵션)
+        mark_previous_current_bad "$current_real"
+
+        # 산출물 패키징
+        package_artifacts "$target"
+
+        ok "Symlink rollback completed"
+      }
+
+      main "$@"
+
+
+
+
     REMOTE_SH
 
       # ── 원격 실행 ─────────────────────────────────────
@@ -2797,4 +3194,3 @@
       rm -f "$remote_script" /tmp/_symlink_rollback_out.txt || true
       ok "Symlink rollback finished"
     }
-
