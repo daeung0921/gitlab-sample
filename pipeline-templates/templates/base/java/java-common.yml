@@ -7,3 +7,4 @@ include:
 variables:
   # Maven 관련
   MAVEN_CLI_OPTS: "-B"
+  MVN_DEBUG: "false"

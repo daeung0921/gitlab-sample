@@ -4,10 +4,11 @@
   script: 
     - !reference [.fn_mvn_build, script] 
     - fn_mvn_build
+    - unzip -o build-artifact.zip -d build-artifact-unpacked
   artifacts:
-    name: "build-artifacts-$CI_COMMIT_REF_SLUG"
+    name: "build-artifacts-$CI_PIPELINE_ID"
     paths:
-      - build-artifact.zip
+      - build-artifact-unpacked/
     reports:
       dotenv: build_status.env       
     expire_in: 1 day
@@ -23,7 +24,7 @@
     - fn_mvn_test
     - unzip -o artifacts/test-reports.zip -d reports
   artifacts:
-    name: "test-reports-$CI_COMMIT_REF_SLUG"
+    name: "test-reports-$CI_PIPELINE_ID"
     paths:
       - reports/
     reports:

@@ -12,10 +12,11 @@
   script:
     - !reference [.fn_tomcat_deploy_snapshot_war, script]
     - fn_tomcat_deploy_snapshot_war
+    - unzip -o artifacts/deploy-snapshot-war-artifacts.zip -d deploy-snapshot-war-unpacked
   artifacts:
-    name: "deploy-war-snapshot-$CI_COMMIT_TAG"
+    name: "deploy-snapshot-war-$CI_PIPELINE_ID"
     paths:
-      - artifacts/deploy-snapshot-war-artifacts.zip
+      - deploy-snapshot-war-unpacked/
     expire_in: 1 day
 
 # ────────────────────────────────────────────────
@@ -32,10 +33,11 @@
   script:
     - !reference [.fn_tomcat_deploy_war, script]
     - fn_tomcat_deploy_war
+    - unzip -o artifacts/deploy-war-artifacts.zip -d deploy-release-war-unpacked
   artifacts:
-    name: "deploy-war-$CI_COMMIT_TAG"
+    name: "deploy-release-war-$CI_PIPELINE_ID"
     paths:
-      - artifacts/deploy-war-artifacts.zip
+      - deploy-release-war-unpacked/
     expire_in: 1 day
 
 # ────────────────────────────────────────────────
@@ -44,8 +46,8 @@
 .deploy_diff:
   stage: deploy
   variables:
-    GIT_STRATEGY: none
-    GIT_CHECKOUT: "false"
+    #GIT_STRATEGY: none
+    #GIT_CHECKOUT: "false"
     HEALTH_MODE: "none"  
     HOT_RELOAD: "false"    
   environment:
@@ -54,20 +56,38 @@
   script:
     - !reference [.fn_tomcat_diff_deploy, script]
     - fn_tomcat_diff_deploy  
+    - unzip -o artifacts/diff-deploy-artifacts.zip -d diff-deploy-unpacked
   artifacts:
-    name: "deploy-diff-$CI_COMMIT_TAG"
+    name: "diff-deploy-$CI_PIPELINE_ID"
     paths:
-      - artifacts/diff-deploy-artifacts.zip
+      - diff-deploy-unpacked/
     expire_in: 1 day
 
 # ────────────────────────────────────────────────
 # 운영 Symbolic Link 전환 배포
 # ────────────────────────────────────────────────
+.deploy_symlink_preview:
+  stage: staging
+  variables: 
+    #GIT_STRATEGY: none
+    #GIT_CHECKOUT: "false"      
+    HEALTH_MODE: "none"  
+    HOT_RELOAD: "false" 
+  script:
+    - !reference [.fn_tomcat_deploy_preview, script]
+    - fn_tomcat_deploy_preview
+    - unzip -o artifacts/symlink-preview-artifacts.zip -d symlink-preview-unpacked
+  artifacts:
+    name: "symlink-preview-$CI_PIPELINE_ID"
+    paths:
+      - symlink-preview-unpacked/
+    expire_in: 1 day
+
 .deploy_symlink:
   stage: deploy
   variables: 
-    GIT_STRATEGY: none
-    GIT_CHECKOUT: "false"      
+    #GIT_STRATEGY: none
+    #GIT_CHECKOUT: "false"      
     HEALTH_MODE: "none"  
     HOT_RELOAD: "false"
   environment:
@@ -76,8 +96,9 @@
   script:
     - !reference [.fn_tomcat_symbolic_deploy, script]
     - fn_tomcat_symbolic_deploy
+    - unzip -o artifacts/symlink-deploy-artifacts.zip -d symlink-deploy-unpacked
   artifacts:
-    name: "deploy-symlink-$CI_COMMIT_TAG"
+    name: "symlink-deploy-$CI_PIPELINE_ID"
     paths:
-      - artifacts/symlink-deploy-artifacts.zip
+      - symlink-deploy-unpacked/
     expire_in: 1 day

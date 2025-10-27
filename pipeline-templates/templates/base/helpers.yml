@@ -3,8 +3,8 @@
 # ────────────────────────────────────────────────
 .init-remote:
   before_script:
-    - echo "▶Init SSH for remote operations"
-    - apk add --no-cache openssh-client zip
+    - echo "▶Init SSH for remote operations" 
+    - apk add --no-cache openssh-client git zip unzip rsync curl
     - mkdir -p ~/.ssh && chmod 700 ~/.ssh
     - '[ -n "$REMOTE_DEPLOY_HOST" ] && ssh-keyscan -p 22 "$REMOTE_DEPLOY_HOST" >> ~/.ssh/known_hosts || true'
     - chmod 644 ~/.ssh/known_hosts

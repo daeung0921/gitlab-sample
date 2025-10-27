@@ -36,33 +36,26 @@
     fn_mvn_build() {
       set -eu
 
-      ###############################################################
-      # 기본 설정
-      # - 이 함수는 로컬 CI 컨테이너 내에서 실행되어 원격 서버에
-      #   소스를 전송하고 SSH로 Maven 빌드를 수행한 뒤 산출물을 가져온다.
-      # - rsync가 양쪽 모두 설치되어 있으면 rsync 방식,
-      #   없으면 tar+ssh 스트리밍 폴백.
-      ###############################################################
-
-      # ──  환경 변수 초기화 (필요 시 CI/CD 변수로 override 가능) ─────────────────────────────────────────────
-      maven_cli_opts="${MAVEN_CLI_OPTS:-"-B"}"            # mvn 옵션 (기본: batch 모드)
-      build_dir="${BUILD_DIR:-"target"}"                  # 원격 빌드 결과 디렉토리 (예: target)
-      zip_file="${ZIP_FILE:-"build-artifact.zip"}"        # 원격 zip 파일명
-      remote_dir="${REMOTE_DIR:?REMOTE_DIR is required}"  # 원격 빌드 작업 디렉토리 (필수)
-      remote_port="${REMOTE_DEPLOY_PORT:-22}"             # SSH 포트 (기본 22)
-      remote_settings="${REMOTE_SETTINGS:-""}"            # Maven settings.xml 경로 (옵션)
-      src_dir="${CI_PROJECT_DIR:-.}"                      # 로컬 소스 루트 경로
-
+      # ──  환경 변수 초기화 (필요 시 CI/CD 변수로 override 가능) ───────────── 
+      maven_cli_opts="${MAVEN_CLI_OPTS:-"-B -V"}"           # 공통 mvn 옵션
+      remote_dir="${REMOTE_DIR:?REMOTE_DIR is required}"    # 원격 작업 디렉터리
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      remote_settings="${REMOTE_SETTINGS:-""}"               # settings.xml 경로(옵션)
+      src_dir="${CI_PROJECT_DIR:-.}"
+      zip_file="${ZIP_FILE:-"build-artifact.zip"}"           # 내려받을 로그 번들명
+      local_zip="${LOCAL_ZIP_OUT:-$zip_file}"
+      mvn_debug="${MVN_DEBUG:-false}"                       # true면 -e -X
+    
       # ── SSH 접속 정보 확인 ─────────────────────────────────────────────
       : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
       : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
-
+    
       # ── 내부 헬퍼 함수 ─────────────────────────────────────────────
       log()  { printf '[INFO] %s\n' "$*"; }
       ok()   { printf '[OK]   %s\n' "$*"; }
-      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
-      shq() { printf "%s" "$1" | sed "s/'/'\\\\''/g"; } # shell-safe quoting for SSH (Alpine BusyBox 호환)
-
+      err() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq() { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+    
       # ── 소스 동기화 (rsync 우선, 없으면 tar 스트리밍) ─────────────────────────────────────────────
       log "▶ Sync sources to remote: $REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_dir"
       if command -v rsync >/dev/null 2>&1 && \
@@ -84,103 +77,107 @@
           | ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
               "mkdir -p '$remote_dir' && tar -xzf - -C '$remote_dir'"
       fi
-
+    
       # ── 원격 빌드 스크립트 생성 ─────────────────────────────────────────────
       remote_script=$(mktemp -t remote_build.XXXXXX)
-      log "Created temporary remote build script: $remote_script"
-
+    
       cat > "$remote_script" <<'REMOTE_SH'
       set -eu
       log()  { printf '[INFO] %s\n' "$*"; }
       ok()   { printf '[OK]   %s\n' "$*"; }
+      err()  { printf '[ERR]  %s\n' "$*" >&2; }
       fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
-
+      
       : "${REMOTE_DIR:?REMOTE_DIR is required}"
-      : "${BUILD_DIR:?BUILD_DIR is required}"
       : "${ZIP_FILE:?ZIP_FILE is required}"
       : "${MVN_OPTS:?MVN_OPTS is required}"
-
-      log "Starting remote Maven build in $REMOTE_DIR"
-
-      # 1> 작업 디렉토리 준비
-      mkdir -p "$REMOTE_DIR"
+      : "${MVN_DEBUG:?MVN_DEBUG is required}"
+      
+      ARTIFACT_DIR="$REMOTE_DIR/artifacts"
+      LOG_DIR="$REMOTE_DIR/_logs"
+      MVN_LOG="$LOG_DIR/mvn.log"
+      ENV_LOG="$LOG_DIR/build-env.txt" 
+      BUNDLE="$ARTIFACT_DIR/$ZIP_FILE"
+      MVN_GOAL="compile"
+      
+      mkdir -p "$ARTIFACT_DIR" "$LOG_DIR"
       cd "$REMOTE_DIR"
+      [ -f pom.xml ] || { err "pom.xml not found in $REMOTE_DIR"; exit 2; }
 
-      # 2> Maven 프로젝트 유효성 확인
-      [ -f "pom.xml" ] || fail "pom.xml not found in $REMOTE_DIR (check source sync)"
+      command -v mvn >/dev/null 2>&1 || fail "Maven not installed"
+      command -v zip >/dev/null 2>&1 || fail "zip not installed" 
 
-      # 3> zip 유틸 설치 (가능한 경우만 시도)
-      if ! command -v zip >/dev/null 2>&1; then
-        log "zip not found, attempting install..."
-        if command -v apk >/dev/null 2>&1; then sudo apk add --no-cache zip || true
-        elif command -v apt-get >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y zip || true
-        elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y zip || true
-        fi
-      fi
-
-      # 4> Maven 실행 준비
-      command -v mvn >/dev/null 2>&1 || fail "Maven not installed or not in PATH"
+      # mvn 체크
+      command -v mvn >/dev/null 2>&1 || err "Maven not installed"
       log "Using Maven: $(command -v mvn)"
       log "Options    : $MVN_OPTS"
-      log "Remote dir : $REMOTE_DIR"
+      log "Debug Mode : $MVN_DEBUG"
 
-      # 5> Maven 빌드 수행
-      log "▶ Running Maven build..."
+      # 환경 수집
+      {
+        echo "== Build Env =="
+        date -u +"%Y-%m-%dT%H:%M:%SZ"
+        uname -a || true
+        (java -version) 2>&1 || true
+        (mvn -v) 2>&1 || true
+      } > "$ENV_LOG"
+      
+      EXTRA_OPTS=""
+      if [ "$MVN_DEBUG" = "true" ]; then
+        EXTRA_OPTS="$EXTRA_OPTS -e -X -DtrimStackTrace=false"
+      fi
+      
+      # 실제 빌드: compile만 수행
+      log "▶ Running: mvn compile"
       if [ -n "${SETTINGS_XML:-}" ]; then
-        mvn $MVN_OPTS -s "$SETTINGS_XML" clean package
+        mvn $MVN_OPTS $EXTRA_OPTS -s "$SETTINGS_XML" compile \
+            2>&1 | tee -a "$MVN_LOG"
       else
-        mvn $MVN_OPTS clean package
+        mvn $MVN_OPTS $EXTRA_OPTS compile \
+            2>&1 | tee -a "$MVN_LOG"
       fi
 
-      [ -d "$BUILD_DIR" ] || fail "Build directory $BUILD_DIR not found after mvn package"
-      ok "Maven build success"
+      status=${PIPESTATUS[0]}
 
-      # 6> 산출물 패키징
-      ARTIFACT_DIR="$REMOTE_DIR/artifacts"
-      mkdir -p "$ARTIFACT_DIR"
-      rm -f "$ARTIFACT_DIR/$ZIP_FILE"
+      log "----- mvn.log (full) -----"
+      cat "$MVN_LOG" || true
+      log "--------------------------"
+      
+      # 로그 번들링
+      rm -f "$BUNDLE"
+      (cd "$REMOTE_DIR" && zip -r "$BUNDLE" "_logs" >/dev/null)
+ 
+      
+      if [ ! -s "$BUNDLE" ]; then
+        err "Logs bundling failed: $BUNDLE"
+      else
+        ok "Logs bundled successfully: $BUNDLE"
+      fi
 
-      log "▶ Packaging artifacts..."
-      zip -r "$ARTIFACT_DIR/$ZIP_FILE" "$BUILD_DIR" >/dev/null || true
-
-      [ -s "$ARTIFACT_DIR/$ZIP_FILE" ] || fail "Artifact zip creation failed"
-      ok "Packaged: $ARTIFACT_DIR/$ZIP_FILE"
+      if [ "$status" -ne 0 ]; then
+        fail "Maven compile failed (exit $status)"
+      fi
+ 
     REMOTE_SH
-
-      # ── 원격 빌드 실행 ─────────────────────────────────────────────
-      log "▶ Executing remote build via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
-      #ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
-      #  REMOTE_DIR="$remote_dir" \
-      #  BUILD_DIR="$build_dir" \
-      #  ZIP_FILE="$zip_file" \
-      #  MVN_OPTS='$maven_cli_opts' \
-      #  SETTINGS_XML="$remote_settings" \
-      #  'sh -s' < "$remote_script"
-
+    
+      # ── 원격 실행 ────────────────────────────────────────
+      log "▶ Executing remote compile (logs-only): ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
       ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
         "REMOTE_DIR='$(shq "$remote_dir")'" \
-        "BUILD_DIR='$(shq "$build_dir")'" \
         "ZIP_FILE='$(shq "$zip_file")'" \
         "MVN_OPTS='$(shq "$maven_cli_opts")'" \
+        "MVN_DEBUG='$(shq "$mvn_debug")'" \
         "SETTINGS_XML='$(shq "$remote_settings")'" \
-        'export REMOTE_DIR BUILD_DIR ZIP_FILE MVN_OPTS SETTINGS_XML; sh -s' \
+        'export REMOTE_DIR ZIP_FILE MVN_OPTS MVN_DEBUG SETTINGS_XML; sh -s' \
         < "$remote_script"
-
-      # ── 산출물 다운로드 ─────────────────────────────────────────────
+    
+      # ── 로그 번들 다운로드 (zip 또는 tar.gz) ───────────────
       remote_zip="${remote_dir}/artifacts/${zip_file}"
-      local_zip="${LOCAL_ZIP_OUT:-$zip_file}"
-
-      log "▶ Downloading artifact: $remote_zip -> $local_zip"
+      log "▶ Downloading logs bundle…"
       scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip" "$local_zip"
-
-      ok "Done: artifact retrieved successfully ($local_zip)"
-
-      # ── 임시 파일 정리 ─────────────────────────────────────────────
+      ok "Downloaded: $local_zip"
+    
       rm -f "$remote_script" || true
-      log "Temporary script cleaned up: $remote_script"
-
-      # ── 원격 디렉토리 정리 (옵션) ─────────────────────────────────────────────
-      # ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" "rm -rf '$remote_dir'" || true
     }
 
 # ────────────────────────────────────────────────
@@ -347,6 +344,7 @@
       remote_settings="${REMOTE_SETTINGS:-""}"
       src_dir="${CI_PROJECT_DIR:-.}"
       snapshot_repo_url="${SNAPSHOT_REPO_URL:?SNAPSHOT_REPO_URL is required}"
+      mvn_debug="${MVN_DEBUG:-false}"   
 
       : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
       : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
@@ -386,49 +384,65 @@
       set -eu
       log()  { printf '[INFO] %s\n' "$*"; }
       ok()   { printf '[OK]   %s\n' "$*"; }
-      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      err() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
 
       : "${REMOTE_DIR:?REMOTE_DIR is required}"
       : "${MVN_OPTS:?MVN_OPTS is required}"
       : "${SNAPSHOT_REPO_URL:?SNAPSHOT_REPO_URL is required}"
+      : "${MVN_DEBUG:?MVN_DEBUG is required}"
 
       ARTIFACTS_DIR="$REMOTE_DIR/artifacts"
-      DEPLOY_LOG="$ARTIFACTS_DIR/deploy-snapshot.log"
+      DEPLOY_LOG="$ARTIFACTS_DIR/deploy-snapshot-to-registry.log"
 
       # 준비
       mkdir -p "$REMOTE_DIR" "$ARTIFACTS_DIR"
       cd "$REMOTE_DIR"
-      [ -f "pom.xml" ] || fail "pom.xml not found in $REMOTE_DIR"
+      [ -f "pom.xml" ] || err "pom.xml not found in $REMOTE_DIR"
 
       # mvn 체크
-      command -v mvn >/dev/null 2>&1 || fail "Maven not installed"
+      command -v mvn >/dev/null 2>&1 || err "Maven not installed"
       log "Using Maven: $(command -v mvn)"
       log "Options    : $MVN_OPTS"
       log "Repo URL   : $SNAPSHOT_REPO_URL"
+      log "Debug Mode : $MVN_DEBUG"
 
+      EXTRA_OPTS=""
+      if [ "$MVN_DEBUG" = "true" ]; then
+        EXTRA_OPTS="$EXTRA_OPTS -e -X -DtrimStackTrace=false"
+      fi
+      
       # 배포 실행
       log "▶ Maven Deploy Snapshot"
       if [ -n "${SETTINGS_XML:-}" ]; then
-        if ! mvn $MVN_OPTS -s "$SETTINGS_XML" clean deploy \
+        if ! mvn $MVN_OPTS $EXTRA_OPTS -s "$SETTINGS_XML" clean deploy \
               -DaltDeploymentRepository=nexus-snapshots::default::"$SNAPSHOT_REPO_URL" 2>&1 | tee "$DEPLOY_LOG"; then
-          fail "Maven deploy failed (see $DEPLOY_LOG)"
+          err "Maven deploy failed (see $DEPLOY_LOG)"
         fi
       else
-        if ! mvn $MVN_OPTS clean deploy \
+        if ! mvn $MVN_OPTS $EXTRA_OPTS clean deploy \
               -DaltDeploymentRepository=nexus-snapshots::default::"$SNAPSHOT_REPO_URL" 2>&1 | tee "$DEPLOY_LOG"; then
-          fail "Maven deploy failed (see $DEPLOY_LOG)"
+          err "Maven deploy failed (see $DEPLOY_LOG)"
         fi
       fi
+
+      log "----- deploy-snapshot-to-registry (full) -----"
+      cat "$DEPLOY_LOG" || true
+      log "--------------------------------------"
+
       ok "Maven snapshot deploy finished"
 
       # 산출물 압축 (WAR/JAR + 로그)
       OUT_ZIP="$ARTIFACTS_DIR/deploy-snapshot-artifacts.zip"
       rm -f "$OUT_ZIP"
       log "▶ Archiving deployed artifacts"
-      # glob이 비어도 실패하지 않도록 || true
-      zip -r "$OUT_ZIP" target/*.war target/*.jar "$DEPLOY_LOG" >/dev/null 2>&1 || true
 
-      [ -s "$OUT_ZIP" ] || fail "No deployment artifacts were archived"
+      # zip 실패해도 전체 흐름 중단하지 않기 위해 || true
+      # zip -r "$OUT_ZIP" target/*.war target/*.jar "$DEPLOY_LOG" >/dev/null 2>&1 || true # 아티팩트 사이즈가 너무 커서 제외함
+      # zip -r "$OUT_ZIP" "$DEPLOY_LOG" >/dev/null 2>&1 || true # 경로보존. *.tar 같은걸 저장하면 -r 옵션 필요 
+      zip -j "$OUT_ZIP" "$DEPLOY_LOG" >/dev/null 2>&1 || true # 경로 삭제
+
+      [ -s "$OUT_ZIP" ] || err "No deployment artifacts were archived"
+
       ok "Packaged: $OUT_ZIP"
     REMOTE_SH
 
@@ -439,7 +453,8 @@
         "MVN_OPTS='$(shq "$maven_cli_opts")'" \
         "SNAPSHOT_REPO_URL='$(shq "$snapshot_repo_url")'" \
         "SETTINGS_XML='$(shq "$remote_settings")'" \
-        'export REMOTE_DIR MVN_OPTS SNAPSHOT_REPO_URL SETTINGS_XML; sh -s' \
+        "MVN_DEBUG='$(shq "$mvn_debug")'" \
+        'export REMOTE_DIR MVN_OPTS SNAPSHOT_REPO_URL SETTINGS_XML MVN_DEBUG; sh -s' \
         < "$remote_script"
 
       # ── 4) 산출물 다운로드 ─────────────────────────────────────────────
@@ -491,6 +506,7 @@
       remote_port="${REMOTE_DEPLOY_PORT:-22}"
       remote_settings="${REMOTE_SETTINGS:-""}"
       src_dir="${CI_PROJECT_DIR:-.}"
+      mvn_debug="${MVN_DEBUG:-false}" 
 
       # ── 유틸 ─────────────────────────────────────────────────
       log()  { printf '[INFO] %s\n' "$*"; }
@@ -532,9 +548,10 @@
       : "${MVN_OPTS:?MVN_OPTS is required}"
       : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
       : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${MVN_DEBUG:?MVN_DEBUG is required}"
 
       ARTIFACTS_DIR="$REMOTE_DIR/artifacts"
-      DEPLOY_LOG="$ARTIFACTS_DIR/deploy-release.log"
+      DEPLOY_LOG="$ARTIFACTS_DIR/deploy-release-to-registry.log"
 
       mkdir -p "$REMOTE_DIR" "$ARTIFACTS_DIR"
       cd "$REMOTE_DIR"
@@ -545,25 +562,31 @@
       log "MVN_OPTS   : $MVN_OPTS"
       log "Release URL: $RELEASE_REPO_URL"
       log "COMMIT_TAG : $COMMIT_TAG"
+      log "Debug Mode : $MVN_DEBUG"
 
-      # 2-1) 태그 → 버전 (v 접두어 제거)
+      EXTRA_OPTS=""
+      if [ "$MVN_DEBUG" = "true" ]; then
+        EXTRA_OPTS="$EXTRA_OPTS -e -X -DtrimStackTrace=false"
+      fi
+
+      # 2-1) pom.xml의 <version> 값을 NEW_VERSION 으로 변경 (태그 → 버전 (v 접두어 제거))
       NEW_VERSION="${COMMIT_TAG#v}"
       [ -n "$NEW_VERSION" ] || fail "Resolved NEW_VERSION is empty"
 
       log "▶ Setting version to $NEW_VERSION"
       if [ -n "${SETTINGS_XML:-}" ]; then
-        mvn $MVN_OPTS -s "$SETTINGS_XML" versions:set -DnewVersion="$NEW_VERSION" -DgenerateBackupPoms=false 2>&1 | tee -a "$DEPLOY_LOG"
+        mvn $MVN_OPTS $EXTRA_OPTS -s "$SETTINGS_XML" versions:set -DnewVersion="$NEW_VERSION" -DgenerateBackupPoms=false 2>&1 | tee -a "$DEPLOY_LOG"
       else
-        mvn $MVN_OPTS versions:set -DnewVersion="$NEW_VERSION" -DgenerateBackupPoms=false 2>&1 | tee -a "$DEPLOY_LOG"
+        mvn $MVN_OPTS $EXTRA_OPTS versions:set -DnewVersion="$NEW_VERSION" -DgenerateBackupPoms=false 2>&1 | tee -a "$DEPLOY_LOG"
       fi
 
-      # 2-2) Release Deploy (신문법: id::url)
+      # 2-2) Release Deploy  
       log "▶ Maven Deploy Release"
       if [ -n "${SETTINGS_XML:-}" ]; then
-        mvn $MVN_OPTS -s "$SETTINGS_XML" clean deploy \
+        mvn $MVN_OPTS $EXTRA_OPTS -s "$SETTINGS_XML" clean deploy \
           -DaltDeploymentRepository="nexus-releases::${RELEASE_REPO_URL}" 2>&1 | tee -a "$DEPLOY_LOG"
       else
-        mvn $MVN_OPTS clean deploy \
+        mvn $MVN_OPTS $EXTRA_OPTS clean deploy \
           -DaltDeploymentRepository="nexus-releases::${RELEASE_REPO_URL}" 2>&1 | tee -a "$DEPLOY_LOG"
       fi
       ok "Maven release deploy finished"
@@ -571,7 +594,8 @@
       # 2-3) 산출물 압축 (WAR/JAR + 로그)
       OUT_ZIP="$ARTIFACTS_DIR/deploy-release-artifacts.zip"
       rm -f "$OUT_ZIP"
-      zip -r "$OUT_ZIP" target/*.war target/*.jar "$DEPLOY_LOG" >/dev/null 2>&1 || true
+      #zip -r "$OUT_ZIP" "$DEPLOY_LOG" >/dev/null 2>&1 || true # 경로보존. *.tar 같은걸 저장하면 -r 옵션 필요 
+      zip -j "$OUT_ZIP" "$DEPLOY_LOG" >/dev/null 2>&1 || true # 경로 삭제
       [ -s "$OUT_ZIP" ] || fail "No deployment artifacts were archived"
       ok "Packaged: $OUT_ZIP"
     REMOTE_SH
@@ -584,7 +608,8 @@
         "RELEASE_REPO_URL='$(shq "$RELEASE_REPO_URL")'" \
         "SETTINGS_XML='$(shq "$remote_settings")'" \
         "COMMIT_TAG='$(shq "$COMMIT_TAG")'" \
-        'export REMOTE_DIR MVN_OPTS RELEASE_REPO_URL SETTINGS_XML COMMIT_TAG; sh -s' \
+        "MVN_DEBUG='$(shq "$mvn_debug")'" \
+        'export REMOTE_DIR MVN_OPTS RELEASE_REPO_URL SETTINGS_XML COMMIT_TAG MVN_DEBUG; sh -s' \
         < "$remote_script"
 
       # ── 4) 산출물 다운로드 (파일 경로 명시) ────────────────────
@@ -849,7 +874,7 @@
       need xmllint || fail "xmllint not available"
 
       ARTIFACTS_DIR="$REMOTE_DIR/artifacts"
-      DEPLOY_LOG="$ARTIFACTS_DIR/deploy-snapshot.log"
+      DEPLOY_LOG="$ARTIFACTS_DIR/deploy-snapshot-to-was.log"
       mkdir -p "$REMOTE_DIR" "$ARTIFACTS_DIR"
       cd "$REMOTE_DIR"
 
@@ -897,24 +922,27 @@
 
       log "▶ Downloading SNAPSHOT WAR: $WAR_URL"
       if ! curl -fsS --insecure --retry 3 -u "$NEXUS_USER:$NEXUS_PASS" -o "$WAR_FILE" "$WAR_URL" 2>&1 | tee -a "$DEPLOY_LOG"; then
-        fail "Failed to download WAR"
+        fail "Failed to download WAR" | tee -a "$DEPLOY_LOG"
       fi
-      [ -s "$WAR_FILE" ] || fail "Downloaded WAR is empty"
+      if [ ! -s "$WAR_FILE" ]; then
+        fail "Downloaded WAR is empty" | tee -a "$DEPLOY_LOG"
+      fi
 
       log "▶ Deploying to Tomcat: http://$WAS_URL (context=$CONTEXT_PATH)"
       if ! curl -fsS --insecure --retry 3 -u "$DEPLOY_USER:$DEPLOY_PASS" \
             -T "$WAR_FILE" \
             "http://$WAS_URL/manager/text/deploy?path=$CONTEXT_PATH&update=true" 2>&1 | tee -a "$DEPLOY_LOG"; then
-        fail "Tomcat deploy failed"
+        fail "Tomcat deploy failed" | tee -a "$DEPLOY_LOG"
       fi
-      ok "Tomcat snapshot deploy success"
+      ok "Tomcat snapshot deploy success" | tee -a "$DEPLOY_LOG"
 
       # 로그 압축
       OUT_ZIP="$ARTIFACTS_DIR/deploy-snapshot-war-artifacts.zip"
       rm -f "$OUT_ZIP"
-      zip -r "$OUT_ZIP" "$DEPLOY_LOG" >/dev/null 2>&1 || true
+      zip -j "$OUT_ZIP" "$DEPLOY_LOG" >/dev/null 2>&1 || true
       [ -s "$OUT_ZIP" ] || fail "No deployment logs were archived"
       ok "Packaged: $OUT_ZIP"
+
     REMOTE_SH
 
       # ── 원격 실행 ────────────────────────────────────────────
@@ -1326,6 +1354,1824 @@
 #   - ln -sT + mv -Tf 조합으로 원자적 전환, 실패 시 rm → mv 폴백 처리.
 #   - NEW_DIR 자동 생성 실패 시(다운로드/무결성 에러/디스크 부족) 즉시 실패(fail-fast).
 # ───────────────────────────────────────────────────────────────────────────────
+.fn_tomcat_diff_deploy2:
+  script: |
+    fn_tomcat_diff_deploy() {
+      set -eu
+
+      # ── 필수 입력 ─────────────────────────────────────
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+      : "${NEXUS_USER:?NEXUS_USER is required}"
+      : "${NEXUS_PASS:?NEXUS_PASS is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      : "${ARTIFACT_USER:?ARTIFACT_USER is required}"
+      : "${ARTIFACT_GROUP:?ARTIFACT_GROUP is required}"       
+
+      # ── 선택 입력(기본값) ───────────────────────────
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      webapps_root="${TOMCAT_WEBAPPS_DIR:-/opt/tomcat/webapps}"
+      releases_base="${RELEASES_BASE:-/opt/tomcat/releases}"
+      artifacts_base="${TOMCAT_ARTIFACTS_DIR:-/opt/tomcat/artifacts}"
+      tomcat_service="${TOMCAT_SERVICE:-tomcat}"
+      keep_releases="${KEEP_RELEASES:-15}"
+
+      # 헬스체크
+      health_mode="${HEALTH_MODE:-page}"           # actuator|page|none
+      health_url_override="${HEALTH_URL_OVERRIDE:-}"
+      hc_timeout="${HEALTHCHECK_TIMEOUT:-60}"
+      hc_interval="${HEALTHCHECK_INTERVAL:-2}"
+
+      # Tomcat manager(핫리로드)
+      hot_reload="${HOT_RELOAD:-false}"
+      deploy_user="${DEPLOY_USER:-}"
+      deploy_pass="${DEPLOY_PASS:-}"
+      was_url="${WAS_URL:-127.0.0.1:8080}"
+
+      auto_fetch_on_missing="true"                 # NEW_DIR 없으면 Nexus에서 내려받아 생성
+
+      # GitLab 산출물 파일명(로컬 Runner 수집용)
+      deploy_log_name="deploy.log"                 # 산출물로 복사되는 이름
+
+      # [ADD] 프리뷰 필터 모드(선택). "static"|"dynamic"|"none"
+      SAFE_FILTER_MODE="${SAFE_FILTER_MODE:-static}"
+
+      # ── 유틸 ─────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      #──────────────────────────── 
+      # fetch_base_commit_from_remote_live
+      #
+      # 목적:
+      #   - 원격 서버의 LIVE 심링크 또는 디렉터리가 가리키는 현재 버전의
+      #     _logs/commit.log 에서 COMMIT 값을 읽어 BASE_COMMIT 변수로 설정
+      #
+      # 동작 개요:
+      #   1. SSH로 원격 접속하여 LIVE 실경로 확인 (readlink -f)
+      #   2. commit.log 존재 시 COMMIT= 값 추출
+      #   3. 성공 시 BASE_COMMIT 환경 변수로 export
+      #───────────────────────────────────────────── 
+      fetch_base_commit_from_remote_live() {
+        : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+        : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+        : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+
+        if [ -n "${BASE_COMMIT:-}" ]; then
+          log "[INFO] BASE_COMMIT 설정됨 → live 에서 읽기 생략"
+          return 0
+        fi
+
+        local remote_port="${REMOTE_DEPLOY_PORT:-22}"
+        local webapps_root="${TOMCAT_WEBAPPS_DIR:-/opt/tomcat/webapps}"
+        local app_name="${CONTEXT_PATH#/}"
+        local live_link="${webapps_root%/}/${app_name}"
+        local prev_commit=""
+
+        log "[SSH] 원격 LIVE commit.log 조회 중: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+
+        prev_commit="$(
+          ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+            "LIVE='$live_link';
+             if sudo test -L \"\$LIVE\"; then REAL=\$(sudo readlink -f \"\$LIVE\" 2>/dev/null || true);
+             elif sudo test -d \"\$LIVE\"; then REAL=\"\$LIVE\"; 
+             else REAL=\"\"; fi;
+             if [ -n \"\$REAL\" ] && sudo test -f \"\$REAL/_logs/commit.log\"; then
+               sudo awk -F= '/^COMMIT=/{print \$2}' \"\$REAL/_logs/commit.log\" | tr -d '\r';
+             fi" 2>/dev/null || true
+        )"
+
+        if [ -n "$prev_commit" ]; then
+          export BASE_COMMIT="$prev_commit"
+          log "[OK] BASE_COMMIT(from remote LIVE): $BASE_COMMIT"
+        else
+          log "[WARN] 원격 LIVE commit.log 없음 → BASE_COMMIT 미설정"
+        fi
+      }
+
+      
+      #######################################################################
+      # 함수: build_predicted_list_b64
+      # 목적:
+      #   - 로컬 git diff 결과를 WAR 내부 배치 경로로 매핑하여
+      #     "예상 변경 목록(predicted.list)"을 생성하고 base64로 인코딩한다.
+      #   - 생성된 base64 문자열은 전역 변수 PREDICTED_LIST_B64에 담긴다.
+      #
+      # 동작:
+      #   1) HEAD_REF: 현재 커밋(HEAD)
+      #   2) BASE_COMMIT: 입력 없으면 HEAD 바로 이전(HEAD~1)
+      #   3) git diff --name-status BASE..HEAD
+      #   4) 경로 매핑 규칙 (WAR 기준):
+      #        - src/main/java/**.java      -> WEB-INF/classes/**.class
+      #        - src/main/resources/**      -> WEB-INF/classes/**
+      #        - src/main/webapp/**         -> (루트 그대로)
+      #
+      # 비고:
+      #   - 컨테이너에 git이 없거나 .git이 없으면 자동 스킵(배포엔 영향 없음)
+      #   - BASE_COMMIT/HEAD_REF 중 하나라도 비면 스킵
+      #######################################################################
+      build_predicted_list_b64() {
+        PREDICTED_LIST_B64=""
+
+        # git 미탑재 또는 .git 없음 → 스킵
+        if ! command -v git >/dev/null 2>&1; then
+          log "git 미탑재: git diff 기반 예상 목록 생략"
+          return 0
+        fi
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          log ".git 없음: git diff 기반 예상 목록 생략"
+          return 0
+        fi
+
+        # HEAD(현재 커밋)
+        local head_ref
+        head_ref="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+
+        # BASE(입력값 우선, 없으면 HEAD~1)
+        local base_ref_input base_ref
+        base_ref_input="${BASE_COMMIT:-}"
+        if [ -n "$base_ref_input" ]; then
+          base_ref="$base_ref_input"
+        else
+          base_ref="$(git rev-parse --verify HEAD~1 2>/dev/null || true)"
+        fi
+
+        # 하나라도 비면 스킵
+        if [ -z "$head_ref" ] || [ -z "$base_ref" ]; then
+          log "git rev-parse 실패: HEAD=$head_ref BASE=$base_ref (예상 목록 생략)"
+          return 0
+        fi
+
+        # 변경 목록 추출 및 WAR 경로로 매핑
+        local tmpd
+        tmpd="$(mktemp -d)"
+        # shellcheck disable=SC2064
+        trap "rm -rf '$tmpd'" EXIT
+
+        git diff --name-status "$base_ref" "$head_ref" > "$tmpd/changed.tab" || true
+        : > "$tmpd/predicted.list"
+
+        # name-status 형식: <status>\t<path>
+        # status 값은 사용하지 않고 path만으로 매핑
+        while IFS=$'\t' read -r _status path || [ -n "${path:-}" ]; do
+          case "$path" in
+            src/main/java/*)
+              # 예: src/main/java/a/b/C.java -> WEB-INF/classes/a/b/C.class
+              base="${path#src/main/java/}"
+              base="${base%.java}"
+              printf 'WEB-INF/classes/%s.class\n' "$base" >> "$tmpd/predicted.list"
+              ;;
+            src/main/resources/*)
+              # 리소스는 classes 루트로 그대로
+              rel="${path#src/main/resources/}"
+              printf 'WEB-INF/classes/%s\n' "$rel" >> "$tmpd/predicted.list"
+              ;;
+            src/main/webapp/*)
+              # webapp 정적 리소스는 WAR 루트로
+              printf '%s\n' "${path#src/main/webapp/}" >> "$tmpd/predicted.list"
+              ;;
+            *) :;;
+          esac
+        done < "$tmpd/changed.tab"
+
+        sort -u "$tmpd/predicted.list" -o "$tmpd/predicted.list"
+
+        # base64 인코딩 (GNU/BSD 차이 고려)
+        if command -v base64 >/dev/null 2>&1; then
+          if base64 --help 2>&1 | grep -q -- '-w'; then
+            PREDICTED_LIST_B64="$(base64 -w0 "$tmpd/predicted.list" || true)"
+          else
+            PREDICTED_LIST_B64="$(base64 < "$tmpd/predicted.list" | tr -d '\n' || true)"
+          fi
+        fi
+      }
+
+      # [ADD-commit.log] 원격 LIVE에서 BASE_COMMIT 확보(있으면 skip)
+      fetch_base_commit_from_remote_live
+      
+      #  로컬 git diff 예측 리스트 생성
+      build_predicted_list_b64
+
+      # [ADD-commit.log] 현재 커밋 SHA 계산(원격 commit.log에 기록용)
+      if [ -n "${CI_COMMIT_SHA:-}" ]; then
+        CURRENT_COMMIT_SHA="$CI_COMMIT_SHA"
+      elif command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        CURRENT_COMMIT_SHA="$(git rev-parse --verify HEAD 2>/dev/null || echo "")"
+      else
+        CURRENT_COMMIT_SHA=""
+      fi
+
+      remote_script=$(mktemp /tmp/remote_diff_deploy.XXXXXX)
+      log "Created temporary diff deploy script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+
+      #!/usr/bin/env bash
+      set -eu
+
+      # ───────────────────────────────────────────────
+      # 공통 유틸 함수
+      # ───────────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      need() { command -v "$1" >/dev/null 2>&1; }
+      ts()   { date +%Y%m%d%H%M%S; }
+      restorecon_if_available() {
+        local p="$1"
+        if command -v restorecon >/dev/null 2>&1; then
+          sudo restorecon -R "$p" >/dev/null 2>&1 || true
+        fi
+      }
+
+      # 파일 타입 검사 도우미
+      is_link() { sudo test -L "$1"; }
+      is_dir()  { sudo test -d "$1"; }
+      is_any()  { sudo test -e "$1" || sudo test -L "$1"; }
+
+      # ───────────────────────────────────────────────
+      # require_envs()
+      # 환경 변수 필수값 확인
+      # ───────────────────────────────────────────────
+      require_envs() {
+        : "${REMOTE_DIR:?REMOTE_DIR is required}"
+        : "${COMMIT_TAG:?COMMIT_TAG is required}"
+        : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+        : "${WEBAPPS_ROOT:?WEBAPPS_ROOT is required}"
+        : "${RELEASES_BASE:?RELEASES_BASE is required}"
+        : "${ARTIFACTS_BASE:?ARTIFACTS_BASE is required}"
+        : "${TOMCAT_SERVICE:?TOMCAT_SERVICE is required}"
+        : "${KEEP_RELEASES:?KEEP_RELEASES is required}"
+        : "${HEALTH_MODE:?HEALTH_MODE is required}"
+        : "${HC_TIMEOUT:?HC_TIMEOUT is required}"
+        : "${HC_INTERVAL:?HC_INTERVAL is required}"
+        : "${NEXUS_USER:?NEXUS_USER is required}"
+        : "${NEXUS_PASS:?NEXUS_PASS is required}"
+        : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+        : "${GROUP_ID:?GROUP_ID is required}"
+        : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+        : "${SAFE_FILTER_MODE:-static}"
+        : "${CURRENT_COMMIT_SHA:=}"
+        : "${BASE_COMMIT:=}"
+        : "${ARTIFACT_USER:?ARTIFACT_USER is required}"
+        : "${ARTIFACT_GROUP:?ARTIFACT_GROUP is required}"
+      }
+
+      # ───────────────────────────────────────────────
+      # ensure_tools()
+      # 필수 도구 설치 확인 (rsync, unzip 등)
+      # ───────────────────────────────────────────────
+      ensure_tools() {
+        for t in rsync ln readlink zip awk sed grep sort uniq curl unzip mktemp df ls tee realpath base64; do
+          if ! need "$t"; then
+            if   need apk; then
+              sudo apk add --no-cache coreutils "$t" || true
+            elif need apt-get; then
+              sudo apt-get update -y && sudo apt-get install -y "$t" || true
+            elif need dnf; then
+              sudo dnf install -y "$t" || true
+            fi
+          fi
+        done
+      }
+
+      # ───────────────────────────────────────────────
+      # setup_context()
+      # 디렉터리 및 배포 경로 설정
+      # ───────────────────────────────────────────────
+      setup_context() {
+        APP_NAME="${CONTEXT_PATH#/}"
+        DEPLOY_VERSION="${COMMIT_TAG#v}"
+
+        LIVE_LINK="${WEBAPPS_ROOT%/}/$APP_NAME"
+        APP_RELEASES_DIR="${RELEASES_BASE%/}/$APP_NAME"
+        NEW_DIR="${ARTIFACTS_BASE%/}/$APP_NAME/$APP_NAME-$DEPLOY_VERSION"
+
+        ART_DIR="$REMOTE_DIR/artifacts"
+        OUT_ZIP="$ART_DIR/diff-deploy-artifacts.zip"
+
+        #uid="$(id -u)"; gid="$(id -g)"
+        sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
+        #sudo chown -R "$uid:$gid" "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
+      }
+
+      # ───────────────────────────────────────────────
+      # maybe_fetch_new_dir()
+      # NEW_DIR이 없을 경우 Nexus에서 WAR 자동 다운로드 및 unzip
+      # ───────────────────────────────────────────────
+      maybe_fetch_new_dir() {
+        if [ -d "$NEW_DIR" ]; then
+          log "기존 NEW_DIR 사용: $NEW_DIR"
+          return
+        fi
+        log "NEW_DIR 없음 → Nexus에서 자동 생성"
+        APP_PATH="${GROUP_ID//.//}/${ARTIFACT_ID}/${DEPLOY_VERSION}"
+        NEW_WAR="${ARTIFACT_ID}-${DEPLOY_VERSION}.war"
+        NEW_URL="${RELEASE_REPO_URL%/}/${APP_PATH}/${NEW_WAR}"
+        TMP_DIR=$(sudo mktemp -d /tmp/${APP_NAME}-${DEPLOY_VERSION}-fetch.XXXXXX)
+
+        sudo curl -fsSL -u "$NEXUS_USER:$NEXUS_PASS" -o "$TMP_DIR/$NEW_WAR" "$NEW_URL"
+        sudo unzip -q "$TMP_DIR/$NEW_WAR" -d "$TMP_DIR/unzip"
+        sudo test -d "$TMP_DIR/unzip/WEB-INF" || fail "WAR 구조 이상"
+        sudo mkdir -p "$(dirname "$NEW_DIR")"
+        sudo rm -rf "$NEW_DIR"
+        sudo mv "$TMP_DIR/unzip" "$NEW_DIR"
+        sudo rm -rf "$TMP_DIR"
+        ok "NEW_DIR 생성 완료: $NEW_DIR"
+      }
+
+      # ───────────────────────────────────────────────
+      # resolve_base_from_live()
+      # LIVE 심볼릭 링크에서 BASE_DIR 추출 또는 초기화
+      # ───────────────────────────────────────────────
+      resolve_base_from_live() {
+        prev_target=""
+        if is_link "$LIVE_LINK"; then
+          prev_target="$(sudo readlink -f "$LIVE_LINK" || true)"
+        elif is_dir "$LIVE_LINK"; then
+          seed="${APP_RELEASES_DIR}/diff-legacy-backup-$(ts)"
+          log "LIVE_DIR 기반 초기 백업 생성 → $seed"
+          sudo rsync -rlpgoDc --delete --exclude='_logs/**' "${LIVE_LINK%/}/" "${seed%/}/" || true
+          prev_target="$seed"
+
+          log "LIVE_DIR 제거 후 seed로 심링크 전환"
+          sudo rm -rf --one-file-system "$LIVE_LINK"
+          sudo ln -sT "$seed" "$LIVE_LINK" || true
+        else
+          log "LIVE_LINK가 없음 → 신규 서비스로 간주, 초기화 모드 실행"
+          seed="${APP_RELEASES_DIR}/diff-initial-${APP_NAME}-$(ts)"
+          sudo mkdir -p "$seed"
+          sudo cp -a "${NEW_DIR%/}/." "$seed/"
+          prev_target="$seed"
+          sudo ln -sT "$seed" "$LIVE_LINK"
+
+          ok "신규 서비스 초기화 완료: $seed"
+        fi
+
+        BASE_DIR="$(sudo readlink -f "$LIVE_LINK" || true)"
+        [ -n "$BASE_DIR" ] || fail "BASE_DIR 확인 실패"
+        [ -n "$prev_target" ] || prev_target="$BASE_DIR"
+      }
+
+      # ───────────────────────────────────────────────
+      # prepare_target_from_prev()
+      # 이전 릴리스 복제 후 TARGET 디렉터리 생성
+      # ───────────────────────────────────────────────
+      prepare_target_from_prev() {
+        stamp="$(ts)"
+        TARGET="${APP_RELEASES_DIR}/diff-${APP_NAME}-${DEPLOY_VERSION}-${stamp}"
+        log "새 TARGET 생성: $TARGET"
+        sudo mkdir -p "$TARGET"
+        sudo rsync -rlpgoDc --delete  --exclude='_logs/**' "${prev_target%/}/" "${TARGET%/}/" || true
+
+        LOG_DIR="${TARGET%/}/_logs"
+        sudo rm -rf "$LOG_DIR"
+        sudo mkdir -p "$LOG_DIR" 
+
+        DIFF_BASE_FILE="$LOG_DIR/diff-base.env"
+        LIVE_POINTER_FILE="$LOG_DIR/live-pointer.env"
+        CHANGED_LIST="$LOG_DIR/changed-files.txt"
+        DELETE_LIST="$LOG_DIR/deleted-files.txt"
+        : > "$CHANGED_LIST"; : > "$DELETE_LIST"
+        printf 'BASE_DIR=%s\n' "$BASE_DIR" > "$DIFF_BASE_FILE"
+
+        # [ADD] 프리뷰/비교 산출물 경로
+        RSYNC_FILTER="$LOG_DIR/rsync.filter"
+        RSYNC_RAW_OUT="$LOG_DIR/rsync.out"
+        RSYNC_PATHS="$LOG_DIR/rsync.paths"
+        REPORT_TXT="$LOG_DIR/report.txt"
+
+        # [ADD] 로컬에서 전달된 git 예측 리스트 복원
+        if [ -n "${PREDICTED_LIST_B64:-}" ]; then
+          echo "$PREDICTED_LIST_B64" | base64 -d > "$LOG_DIR/predicted.list" || true
+        else
+          : > "$LOG_DIR/predicted.list"
+        fi
+      }
+
+      # ───────────────────────────────────────────────
+      # [ADD] 필터 생성 (SAFE_FILTER_MODE=static|dynamic|none)
+      # ───────────────────────────────────────────────
+      make_filter_if_enabled() {
+        case "${SAFE_FILTER_MODE:-static}" in
+          none|"") return 0 ;;
+          static)
+            sudo printf '%s\n' \
+            '+ /WEB-INF/classes/***' \
+            '+ /WEB-INF/lib/***' \
+            '+ *.jsp' \
+            '+ *.jspf' \
+            '+ *.jspx' \
+            '+ *.tag' \
+            '+ *.tagx' \
+            '+ *.tld' \
+            '+ /WEB-INF/**/*.jsp' \
+            '+ /WEB-INF/**/*.jspf' \
+            '+ /WEB-INF/**/*.jspx' \
+            '+ /WEB-INF/**/*.tag' \
+            '+ /WEB-INF/**/*.tagx' \
+            '+ /WEB-INF/**/*.tld' \
+            '+ *.html' \
+            '+ *.htm' \
+            '+ *.css' \
+            '+ *.js' \
+            '+ *.png' \
+            '+ *.jpg' \
+            '+ *.jpeg' \
+            '+ *.gif' \
+            '+ *.svg' \
+            '+ *.webp' \
+            '+ favicon.ico' \
+            '+ *.xml' \
+            '+ *.properties' \
+            '+ *.yml' \
+            '+ *.yaml' \
+            '+ MANIFEST.MF' \
+            '+ /META-INF/resources/***' \
+            '- *' \
+            | sudo tee "$RSYNC_FILTER" >/dev/null
+            ;;
+          dynamic)
+            sudo printf '%s\n' \
+            '+ /WEB-INF/classes/***' \
+            '+ /WEB-INF/lib/***' \
+            '+ /META-INF/***' \
+            '+ /BOOT-INF/***' \
+            '+ /static/***' \
+            '+ /public/***' \
+            '+ /assets/***' \
+            '+ /resources/***' \
+            '+ *.css' \
+            '+ *.js' \
+            '+ *.mjs' \
+            '+ *.map' \
+            '+ *.json' \
+            '+ *.html' \
+            '+ *.htm' \
+            '+ *.png' \
+            '+ *.jpg' \
+            '+ *.jpeg' \
+            '+ *.gif' \
+            '+ *.svg' \
+            '+ *.webp' \
+            '+ *.jsp' \
+            '+ *.jspf' \
+            '+ *.jspx' \
+            '+ *.tag' \
+            '+ *.tagx' \
+            '+ *.tld' \
+            '+ *.xhtml' \
+            '+ /WEB-INF/**/*.jsp' \
+            '+ /WEB-INF/**/*.jspf' \
+            '+ /WEB-INF/**/*.jspx' \
+            '+ /WEB-INF/**/*.tag' \
+            '+ /WEB-INF/**/*.tagx' \
+            '+ /WEB-INF/**/*.tld' \
+            '+ /WEB-INF/**/*.xhtml' \
+            '+ *.xml' \
+            '+ *.properties' \
+            '+ *.yml' \
+            '+ *.yaml' \
+            '+ *.ini' \
+            '+ *.conf' \
+            '+ *.cfg' \
+            '+ *.env' \
+            '+ *.txt' \
+            '+ *.csv' \
+            '+ *.tsv' \
+            '+ *.json5' \
+            '+ *.ftl' \
+            '+ *.vm' \
+            '+ *.mustache' \
+            '+ *.hbs' \
+            '+ /templates/***' \
+            '+ /views/***' \
+            '+ MANIFEST.MF' \
+            '+ application.properties' \
+            '+ application.yml' \
+            '+ application.yaml' \
+            '+ logback*.xml' \
+            '+ logging*.xml' \
+            '+ context*.xml' \
+            '+ web.xml' \
+            '+ robots.txt' \
+            '+ sitemap.xml' \
+            '+ favicon.ico' \
+            '+ .well-known/***' \
+            '+ /META-INF/resources/***' \
+            '- *' \
+            | sudo tee "$RSYNC_FILTER" >/dev/null
+            ;;
+          *) :;;
+        esac
+      }
+
+      # ───────────────────────────────────────────────
+      # compute_diff_lists()
+      # rsync dry-run 결과를 기반으로 변경/삭제 파일 목록 계산
+      # ───────────────────────────────────────────────
+      compute_diff_lists() {
+        log "Rsync dry-run 실행 중 (NEW vs BASE)"
+
+        make_filter_if_enabled
+
+        # 공통 exclude (로그/임시파일 등)
+        common_excludes=(--exclude='_logs' --exclude='_logs/**' \
+                         --exclude='*.bad' --exclude='*.tmp' --exclude='*.bak' \
+                         --exclude='*.swp' --exclude='*.log')
+
+        # [KEEP] 필터 있으면 merge 사용
+        if [ -f "$RSYNC_FILTER" ]; then
+          sudo rsync -rlDic --delete --dry-run --out-format='%i %n' \
+            --filter="merge $RSYNC_FILTER" \
+            "${common_excludes[@]}" \
+            "${NEW_DIR%/}/" "${BASE_DIR%/}/" | tee "$RSYNC_RAW_OUT" >/dev/null
+        else
+          sudo rsync -rlDic --delete --dry-run --out-format='%i %n' \
+            "${common_excludes[@]}" \
+            "${NEW_DIR%/}/" "${BASE_DIR%/}/" | tee "$RSYNC_RAW_OUT" >/dev/null
+        fi
+
+        # 경로만 추출(디렉터리 제거) → rsync.paths
+        awk '{sub(/^[^ ]+[ ]+/,""); print}' "$RSYNC_RAW_OUT" \
+          | sed -e 's#^\.\/##' -e '/\/$/d' \
+          | sort -u > "$RSYNC_PATHS" || true
+
+        # 삭제/변경 파일 목록 산출 (파일 기준)
+        > "$CHANGED_LIST"; > "$DELETE_LIST"
+        while IFS= read -r ln; do
+          # 삭제
+          if [[ "$ln" == *"deleting "* ]]; then
+            f="${ln#*deleting }"
+            echo "$f" >> "$DELETE_LIST"
+            continue
+          fi
+          # 코드 / 경로 분리
+          code="${ln%% *}"
+          f="${ln#* }"
+          [[ "$f" == */ ]] && continue
+          # 파일 전송/생성/속성변경 포함
+          case "$code" in
+            ">f"*)         echo "$f" >> "$CHANGED_LIST" ;;  # 새로 전송된 파일
+            ".f"*)         echo "$f" >> "$CHANGED_LIST" ;;  # 파일 속성만 변경
+            c[fps]*)       echo "$f" >> "$CHANGED_LIST" ;;  # 생성/특수 케이스(cf, cp, cs 등)
+            *)             : ;;
+          esac
+        done < "$RSYNC_RAW_OUT"
+
+        # [ADD] git 예상 vs rsync 결과 교차 비교
+        if [ -s "$LOG_DIR/predicted.list" ]; then
+          sort -u "$LOG_DIR/predicted.list" -o "$LOG_DIR/predicted.list"
+          comm -12 "$LOG_DIR/predicted.list" "$RSYNC_PATHS" > "$LOG_DIR/intersection.txt" || true
+          comm -23 "$LOG_DIR/predicted.list" "$RSYNC_PATHS" > "$LOG_DIR/missing.from.rsync.txt" || true
+          comm -13 "$LOG_DIR/predicted.list" "$RSYNC_PATHS" > "$LOG_DIR/extra.in.rsync.txt" || true
+        else
+          : > "$LOG_DIR/intersection.txt"
+          : > "$LOG_DIR/missing.from.rsync.txt"
+          : > "$LOG_DIR/extra.in.rsync.txt"
+        fi
+
+        # [ADD] 프리뷰 리포트 출력 (_logs/report.txt)
+        {
+          echo "=== Diff Deploy Preview Report ==="
+          echo "Version   : $DEPLOY_VERSION"
+          echo "Context   : $APP_NAME"
+          echo "Base Dir  : $BASE_DIR"
+          echo "New Dir   : $NEW_DIR"
+          echo "Filter    : ${SAFE_FILTER_MODE:-static}"
+          echo
+          echo "[GIT DIFF 예상 변경 개수]"
+          (wc -l < "$LOG_DIR/predicted.list") 2>/dev/null || echo 0
+          head -30 "$LOG_DIR/predicted.list" 2>/dev/null || true
+          echo
+          echo "[rsync --dry-run 파일 변경 개수]"
+          (wc -l < "$RSYNC_PATHS") 2>/dev/null || echo 0
+          head -30 "$RSYNC_PATHS" 2>/dev/null || true
+          echo
+          echo "[교집합] git 예상 ∩ rsync"
+          head -30 "$LOG_DIR/intersection.txt" 2>/dev/null || true
+          echo
+          echo "[MISSING] git 변경에는 있지만 rsync 없음"
+          head -30 "$LOG_DIR/missing.from.rsync.txt" 2>/dev/null || true
+          echo
+          echo "[EXTRA] rsync에는 있지만 예상에 없음"
+          head -30 "$LOG_DIR/extra.in.rsync.txt" 2>/dev/null || true
+          echo
+          echo "[삭제 건수]"
+          (wc -l < "$DELETE_LIST") 2>/dev/null || echo 0
+          echo "[변경/생성 건수]"
+          (wc -l < "$CHANGED_LIST") 2>/dev/null || echo 0
+        } > "$REPORT_TXT" || true
+        log "프리뷰 리포트: $REPORT_TXT"
+      }
+
+      # ───────────────────────────────────────────────
+      # apply_deletions()
+      # DELETE_LIST 기반 안전 삭제 (심볼릭 링크는 링크 자체만 제거)
+      # ───────────────────────────────────────────────
+      apply_deletions() {
+        local target="$1" list="$2"
+        rp_tgt="$(realpath -m -- "$target")"
+        pushd "$rp_tgt" >/dev/null
+        while IFS= read -r rel || [[ -n "${rel:-}" ]]; do
+          [[ -z "$rel" ]] && continue
+          if [[ "$rel" = /* || "$rel" = *".."* ]]; then
+            echo "[SKIP] 위험 경로: $rel"
+            continue
+          fi
+          if [[ -L "$rel" ]]; then
+            echo "[DEL] (symlink) $rel"
+            sudo rm -f -- "$rel"
+          elif [[ -e "$rel" ]]; then
+            echo "[DEL] $rel"
+            sudo rm -rf --one-file-system -- "$rel"
+          fi
+        done < "$list"
+        popd >/dev/null
+      }
+
+      # ───────────────────────────────────────────────
+      # apply_changes()
+      # CHANGED_LIST 기반으로 변경 파일만 복사
+      # ───────────────────────────────────────────────
+      apply_changes() {
+        if [ -s "$CHANGED_LIST" ]; then
+          # # [FIX] 내용만 갱신하고, 기존 소유자/그룹/권한은 유지 (-o -g -p 제거)
+          sudo rsync -rlDic --files-from="$CHANGED_LIST" "${NEW_DIR%/}/" "${TARGET%/}/"
+        fi
+      }
+
+      # ───────────────────────────────────────────────
+      # switch_live_symlink()
+      # LIVE 심볼릭 링크를 새 TARGET으로 전환
+      # ───────────────────────────────────────────────
+      switch_live_symlink() {
+        tmp_link="${LIVE_LINK}.new.$(ts)"
+        sudo ln -sT "$TARGET" "$tmp_link" || sudo ln -s "$TARGET" "$tmp_link"
+        sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || {
+          sudo rm -rf --one-file-system "$LIVE_LINK"
+          sudo mv "$tmp_link" "$LIVE_LINK"
+        }
+        log "LIVE → $TARGET 전환 완료"
+      }
+
+      # ───────────────────────────────────────────────
+      # update_live_pointer()
+      # 심링크 교체후에 라이브 포인터 정보 재기록
+      # ───────────────────────────────────────────────
+      update_live_pointer() {
+        local current="$TARGET"
+        local prev="$prev_target"   # BASE_DIR로 기록하고 싶으면 prev="$BASE_DIR"
+        sudo sh -c "printf 'CURRENT=%s\nPREV=%s\n' '$current' '${prev:-}' > '$TARGET/_logs/live-pointer.env'"
+      }
+
+      # ───────────────────────────────────────────────
+      # reload_or_restart_tomcat()
+      # Tomcat 핫리로드 or 재기동 처리
+      # ───────────────────────────────────────────────
+      reload_or_restart_tomcat() {
+        if [ "$HOT_RELOAD" = "true" ] && [ -n "$DEPLOY_USER" ]; then
+          sudo curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" || true
+        else
+          sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null || sudo systemctl restart "$TOMCAT_SERVICE"
+        fi
+      }
+
+      # ───────────────────────────────────────────────
+      # do_healthcheck()
+      # 배포 후 서비스 정상 응답 확인
+      # ───────────────────────────────────────────────
+      do_healthcheck() {
+        case "$HEALTH_MODE" in
+          actuator) hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
+          page)     hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
+          none)     return ;;
+          *)        hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
+        esac
+
+        elapsed=0
+        while [ "$elapsed" -lt "$HC_TIMEOUT" ]; do
+          if sudo curl -fsS --max-time 3 "$hc_url" >/dev/null 2>&1; then
+            ok "헬스체크 성공: $hc_url"
+            return
+          fi
+          sleep "$HC_INTERVAL"; elapsed=$((elapsed+HC_INTERVAL))
+        done
+        fail "헬스체크 실패: $hc_url"
+      }
+
+      # ───────────────────────────────────────────────
+      # prune_releases()
+      # KEEP_RELEASES 초과 버전 정리
+      # ───────────────────────────────────────────────
+      prune_releases() {
+        mapfile -t snaps < <(sudo ls -1dt "${APP_RELEASES_DIR}/diff-${APP_NAME}-"* 2>/dev/null || true)
+        if [ "${#snaps[@]}" -gt "$KEEP_RELEASES" ]; then
+          for ((i=KEEP_RELEASES; i<${#snaps[@]}; i++)); do
+            [ "${snaps[$i]}" = "$TARGET" ] && continue
+            sudo rm -rf --one-file-system "${snaps[$i]}" || true
+          done
+        fi
+      }
+
+      # ───────────────────────────────────────────────
+      # package_artifacts()
+      # 로그, 목록 파일 등을 ZIP으로 압축
+      # ───────────────────────────────────────────────
+      package_artifacts() {
+        sudo cp -f "$DIFF_BASE_FILE" "$ART_DIR/diff-base.env" || true
+        sudo cp -f "$CHANGED_LIST" "$ART_DIR/changed-files.txt" || true
+        sudo cp -f "$DELETE_LIST" "$ART_DIR/deleted-files.txt" || true
+        # [ADD] 프리뷰 산출물도 같이 담기
+        sudo cp -f "$RSYNC_RAW_OUT" "$ART_DIR/rsync.out" 2>/dev/null || true
+        sudo cp -f "$RSYNC_PATHS" "$ART_DIR/rsync.paths" 2>/dev/null || true
+        sudo cp -f "$REPORT_TXT" "$ART_DIR/report.txt" 2>/dev/null || true
+        sudo cp -f "$RSYNC_FILTER" "$ART_DIR/rsync.filter" 2>/dev/null || true
+        # [ADD] git diff 비교 산출물
+        sudo cp -f "$LOG_DIR/predicted.list" "$ART_DIR/predicted.list" 2>/dev/null || true
+        sudo cp -f "$LOG_DIR/intersection.txt" "$ART_DIR/intersection.txt" 2>/dev/null || true
+        sudo cp -f "$LOG_DIR/missing.from.rsync.txt" "$ART_DIR/missing.from.rsync.txt" 2>/dev/null || true
+        sudo cp -f "$LOG_DIR/extra.in.rsync.txt" "$ART_DIR/extra.in.rsync.txt" 2>/dev/null || true
+
+        {
+          echo "DEPLOYED_VERSION=$DEPLOY_VERSION"
+          echo "LIVE_LINK=$LIVE_LINK"
+          echo "TARGET=$TARGET"
+          echo "BASE_DIR=$BASE_DIR"
+        } > "$ART_DIR/.env"
+
+        ( cd "$ART_DIR" && zip -r "$(basename "$OUT_ZIP")" .env *.txt rsync.* *.list >/dev/null 2>&1 || true )
+        ok "배포 로그 ZIP 생성 완료"
+        echo "$OUT_ZIP"
+      }
+
+      # [ADD-commit.log] ─────────────────────────────────────────────
+      # ───────────────────────────────────────────────
+      # [NEW] 함수: write_pre_deploy_commit_log_if_missing
+      # 목적:
+      #   - BASE_COMMIT 값이 있을 경우,
+      #     LIVE 디렉터리에 commit.log가 없으면 자동으로 생성
+      #   - 기존 commit.log가 있거나 BASE_COMMIT이 비어 있으면 아무 작업 안 함
+      # ───────────────────────────────────────────────
+      write_pre_deploy_commit_log_if_missing() {
+        # BASE_COMMIT이 없으면 스킵
+        if [ -z "${BASE_COMMIT:-}" ]; then
+          log "[PRE-DEPLOY] BASE_COMMIT 미설정 → commit.log 기록 생략"
+          return 0
+        fi
+      
+        # LIVE 실경로 추적 (심링크 or 디렉터리)
+        local live_real=""
+        if sudo test -L "$LIVE_LINK"; then
+          live_real="$(sudo readlink -f "$LIVE_LINK" 2>/dev/null || true)"
+        elif sudo test -d "$LIVE_LINK"; then
+          live_real="$LIVE_LINK"
+        fi
+      
+        # 유효한 LIVE가 없으면 스킵
+        if [ -z "$live_real" ] || ! sudo test -d "$live_real"; then
+          log "[PRE-DEPLOY] LIVE 디렉터리 없음 → commit.log 기록 생략"
+          return 0
+        fi
+      
+        # 이미 commit.log가 존재하면 스킵
+        local logf="$live_real/_logs/commit.log"
+        if sudo test -f "$logf"; then
+          log "[PRE-DEPLOY] 기존 commit.log 존재 → skip ($logf)"
+          return 0
+        fi
+      
+        # 생성
+        sudo mkdir -p "$live_real/_logs"
+        sudo sh -c "printf 'COMMIT=%s\nDATE=%s\nNOTE=base_commit_predeploy\n' \
+          \"$BASE_COMMIT\" \"\$(date -Iseconds)\" > '$logf'"
+        log "[PRE-DEPLOY] commit.log 생성 완료: $logf (COMMIT=$BASE_COMMIT)"
+      }
+      
+      write_commit_log() {
+        # diff-deploy는 TARGET 디렉터리가 최종 LIVE가 됨
+        local file="$TARGET/_logs/commit.log"
+        sudo mkdir -p "$(dirname "$file")"
+        sudo sh -c "printf 'COMMIT=%s\nTAG=%s\nVERSION=%s\nDATE=%s\n' \
+          \"$CURRENT_COMMIT_SHA\" \"$COMMIT_TAG\" \"$DEPLOY_VERSION\" \"\$(date -Iseconds)\" > \"$file\""
+        log "Wrote commit info to ${file}" 
+      }
+
+      # ────────────────────────────────────────────────
+
+      main() {
+        require_envs
+        ensure_tools
+        setup_context
+        maybe_fetch_new_dir
+        resolve_base_from_live
+        write_pre_deploy_commit_log_if_missing      # [ADD-commit.log] 배포 전 보강
+        prepare_target_from_prev
+        compute_diff_lists
+        apply_deletions "$TARGET" "$DELETE_LIST"
+        apply_changes
+        switch_live_symlink
+        reload_or_restart_tomcat
+        do_healthcheck
+        update_live_pointer
+        write_commit_log  # [ADD-commit.log] 배포 후 기록
+        prune_releases
+        package_artifacts
+      }
+
+      main "$@"
+
+    REMOTE_SH
+
+      log "▶ Executing diff deploy via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "COMMIT_TAG='$(shq "$COMMIT_TAG")'" \
+        "CONTEXT_PATH='$(shq "$CONTEXT_PATH")'" \
+        "WEBAPPS_ROOT='$(shq "$webapps_root")'" \
+        "RELEASES_BASE='$(shq "$releases_base")'" \
+        "ARTIFACTS_BASE='$(shq "$artifacts_base")'" \
+        "TOMCAT_SERVICE='$(shq "$tomcat_service")'" \
+        "KEEP_RELEASES='$(shq "$keep_releases")'" \
+        "HEALTH_MODE='$(shq "$health_mode")'" \
+        "HEALTH_URL_OVERRIDE='$(shq "$health_url_override")'" \
+        "HC_TIMEOUT='$(shq "$hc_timeout")'" \
+        "HC_INTERVAL='$(shq "$hc_interval")'" \
+        "HOT_RELOAD='$(shq "$hot_reload")'" \
+        "DEPLOY_USER='$(shq "$deploy_user")'" \
+        "DEPLOY_PASS='$(shq "$deploy_pass")'" \
+        "WAS_URL='$(shq "$was_url")'" \
+        "AUTO_FETCH_ON_MISSING='true'" \
+        "NEXUS_USER='$(shq "$NEXUS_USER")'" \
+        "NEXUS_PASS='$(shq "$NEXUS_PASS")'" \
+        "RELEASE_REPO_URL='$(shq "$RELEASE_REPO_URL")'" \
+        "GROUP_ID='$(shq "$GROUP_ID")'" \
+        "ARTIFACT_ID='$(shq "$ARTIFACT_ID")'" \
+        "SAFE_FILTER_MODE='$(shq "$SAFE_FILTER_MODE")'" \
+        "PREDICTED_LIST_B64='$(shq "$PREDICTED_LIST_B64")'" \
+        "CURRENT_COMMIT_SHA='$(shq "${CURRENT_COMMIT_SHA:-}")'" \
+        "BASE_COMMIT='$(shq "${BASE_COMMIT:-}")'" \
+        "ARTIFACT_USER='$(shq "$ARTIFACT_USER")'" \
+        "ARTIFACT_GROUP='$(shq "$ARTIFACT_GROUP")'" \
+        'export REMOTE_DIR COMMIT_TAG CONTEXT_PATH WEBAPPS_ROOT RELEASES_BASE ARTIFACTS_BASE TOMCAT_SERVICE KEEP_RELEASES HEALTH_MODE HEALTH_URL_OVERRIDE HC_TIMEOUT HC_INTERVAL HOT_RELOAD DEPLOY_USER DEPLOY_PASS WAS_URL AUTO_FETCH_ON_MISSING NEXUS_USER NEXUS_PASS RELEASE_REPO_URL GROUP_ID ARTIFACT_ID SAFE_FILTER_MODE PREDICTED_LIST_B64 CURRENT_COMMIT_SHA BASE_COMMIT ARTIFACT_USER ARTIFACT_GROUP; bash -s' \
+        < "$remote_script" | tee /tmp/_diff_deploy_out.txt
+
+      remote_zip_path="$(tail -n1 /tmp/_diff_deploy_out.txt || true)"
+      [ -z "$remote_zip_path" ] && remote_zip_path="${REMOTE_DIR}/artifacts/diff-deploy-artifacts.zip"
+      local_dir="${CI_PROJECT_DIR:-.}/artifacts"
+      mkdir -p "$local_dir"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip_path" "$local_dir/" || true
+
+      rm -f "$remote_script" /tmp/_diff_deploy_out.txt || true
+      ok "Diff deploy finished"
+    }
+
+
+.fn_tomcat_diff_deploy3:
+  script: |
+    fn_tomcat_diff_deploy() {
+      set -eu
+
+      # ── 필수 입력 ─────────────────────────────────────
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+      : "${NEXUS_USER:?NEXUS_USER is required}"
+      : "${NEXUS_PASS:?NEXUS_PASS is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      : "${ARTIFACT_USER:?ARTIFACT_USER is required}"
+      : "${ARTIFACT_GROUP:?ARTIFACT_GROUP is required}"       
+
+      # ── 선택 입력(기본값) ───────────────────────────
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      webapps_root="${TOMCAT_WEBAPPS_DIR:-/opt/tomcat/webapps}"
+      releases_base="${RELEASES_BASE:-/opt/tomcat/releases}"
+      artifacts_base="${TOMCAT_ARTIFACTS_DIR:-/opt/tomcat/artifacts}"
+      tomcat_service="${TOMCAT_SERVICE:-tomcat}"
+      keep_releases="${KEEP_RELEASES:-15}"
+
+      # 헬스체크
+      health_mode="${HEALTH_MODE:-page}"           # actuator|page|none
+      health_url_override="${HEALTH_URL_OVERRIDE:-}"
+      hc_timeout="${HEALTHCHECK_TIMEOUT:-60}"
+      hc_interval="${HEALTHCHECK_INTERVAL:-2}"
+
+      # Tomcat manager(핫리로드)
+      hot_reload="${HOT_RELOAD:-false}"
+      deploy_user="${DEPLOY_USER:-}"
+      deploy_pass="${DEPLOY_PASS:-}"
+      was_url="${WAS_URL:-127.0.0.1:8080}"
+
+      auto_fetch_on_missing="true"                 # NEW_DIR 없으면 Nexus에서 내려받아 생성
+
+      # GitLab 산출물 파일명(로컬 Runner 수집용)
+      deploy_log_name="deploy.log"                 # 산출물로 복사되는 이름
+
+      # [ADD] 프리뷰 필터 모드(선택). "static"|"dynamic"|"none"
+      SAFE_FILTER_MODE="${SAFE_FILTER_MODE:-static}"
+
+      # ── 유틸 ─────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      #──────────────────────────── 
+      # fetch_base_commit_from_remote_live
+      #
+      # 목적:
+      #   - 원격 서버의 LIVE 심링크 또는 디렉터리가 가리키는 현재 버전의
+      #     _logs/commit.log 에서 COMMIT 값을 읽어 BASE_COMMIT 변수로 설정
+      #
+      # 동작 개요:
+      #   1. SSH로 원격 접속하여 LIVE 실경로 확인 (readlink -f)
+      #   2. commit.log 존재 시 COMMIT= 값 추출
+      #   3. 성공 시 BASE_COMMIT 환경 변수로 export
+      #───────────────────────────────────────────── 
+      fetch_base_commit_from_remote_live() {
+        : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+        : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+        : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+
+        if [ -n "${BASE_COMMIT:-}" ]; then
+          log "[INFO] BASE_COMMIT 설정됨 → live 에서 읽기 생략"
+          return 0
+        fi
+
+        local remote_port="${REMOTE_DEPLOY_PORT:-22}"
+        local webapps_root="${TOMCAT_WEBAPPS_DIR:-/opt/tomcat/webapps}"
+        local app_name="${CONTEXT_PATH#/}"
+        local live_link="${webapps_root%/}/${app_name}"
+        local prev_commit=""
+
+        log "[SSH] 원격 LIVE commit.log 조회 중: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+
+        prev_commit="$(
+          ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+            "LIVE='$live_link';
+             if sudo test -L \"\$LIVE\"; then REAL=\$(sudo readlink -f \"\$LIVE\" 2>/dev/null || true);
+             elif sudo test -d \"\$LIVE\"; then REAL=\"\$LIVE\"; 
+             else REAL=\"\"; fi;
+             if [ -n \"\$REAL\" ] && sudo test -f \"\$REAL/_logs/commit.log\"; then
+               sudo awk -F= '/^COMMIT=/{print \$2}' \"\$REAL/_logs/commit.log\" | tr -d '\r';
+             fi" 2>/dev/null || true
+        )"
+
+        if [ -n "$prev_commit" ]; then
+          export BASE_COMMIT="$prev_commit"
+          log "[OK] BASE_COMMIT(from remote LIVE): $BASE_COMMIT"
+        else
+          log "[WARN] 원격 LIVE commit.log 없음 → BASE_COMMIT 미설정"
+        fi
+      }
+
+      
+      #######################################################################
+      # 함수: build_predicted_list_b64
+      # 목적:
+      #   - 로컬 git diff 결과를 WAR 내부 배치 경로로 매핑하여
+      #     "예상 변경 목록(predicted.list)"을 생성하고 base64로 인코딩한다.
+      #   - 생성된 base64 문자열은 전역 변수 PREDICTED_LIST_B64에 담긴다.
+      #
+      # 동작:
+      #   1) HEAD_REF: 현재 커밋(HEAD)
+      #   2) BASE_COMMIT: 입력 없으면 HEAD 바로 이전(HEAD~1)
+      #   3) git diff --name-status BASE..HEAD
+      #   4) 경로 매핑 규칙 (WAR 기준):
+      #        - src/main/java/**.java      -> WEB-INF/classes/**.class
+      #        - src/main/resources/**      -> WEB-INF/classes/**
+      #        - src/main/webapp/**         -> (루트 그대로)
+      #
+      # 비고:
+      #   - 컨테이너에 git이 없거나 .git이 없으면 자동 스킵(배포엔 영향 없음)
+      #   - BASE_COMMIT/HEAD_REF 중 하나라도 비면 스킵
+      #######################################################################
+      build_predicted_list_b64() {
+        PREDICTED_LIST_B64=""
+
+        # git 미탑재 또는 .git 없음 → 스킵
+        if ! command -v git >/dev/null 2>&1; then
+          log "git 미탑재: git diff 기반 예상 목록 생략"
+          return 0
+        fi
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          log ".git 없음: git diff 기반 예상 목록 생략"
+          return 0
+        fi
+
+        # HEAD(현재 커밋)
+        local head_ref
+        head_ref="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+
+        # BASE(입력값 우선, 없으면 HEAD~1)
+        local base_ref_input base_ref
+        base_ref_input="${BASE_COMMIT:-}"
+        if [ -n "$base_ref_input" ]; then
+          base_ref="$base_ref_input"
+        else
+          base_ref="$(git rev-parse --verify HEAD~1 2>/dev/null || true)"
+        fi
+
+        # 하나라도 비면 스킵
+        if [ -z "$head_ref" ] || [ -z "$base_ref" ]; then
+          log "git rev-parse 실패: HEAD=$head_ref BASE=$base_ref (예상 목록 생략)"
+          return 0
+        fi
+
+        # 변경 목록 추출 및 WAR 경로로 매핑
+        local tmpd
+        tmpd="$(mktemp -d)"
+        # shellcheck disable=SC2064
+        trap "rm -rf '$tmpd'" EXIT
+
+        git diff --name-status "$base_ref" "$head_ref" > "$tmpd/changed.tab" || true
+        : > "$tmpd/predicted.list"
+
+        # name-status 형식: <status>\t<path>
+        # status 값은 사용하지 않고 path만으로 매핑
+        while IFS=$'\t' read -r _status path || [ -n "${path:-}" ]; do
+          case "$path" in
+            src/main/java/*)
+              # 예: src/main/java/a/b/C.java -> WEB-INF/classes/a/b/C.class
+              base="${path#src/main/java/}"
+              base="${base%.java}"
+              printf 'WEB-INF/classes/%s.class\n' "$base" >> "$tmpd/predicted.list"
+              ;;
+            src/main/resources/*)
+              # 리소스는 classes 루트로 그대로
+              rel="${path#src/main/resources/}"
+              printf 'WEB-INF/classes/%s\n' "$rel" >> "$tmpd/predicted.list"
+              ;;
+            src/main/webapp/*)
+              # webapp 정적 리소스는 WAR 루트로
+              printf '%s\n' "${path#src/main/webapp/}" >> "$tmpd/predicted.list"
+              ;;
+            *) :;;
+          esac
+        done < "$tmpd/changed.tab"
+
+        sort -u "$tmpd/predicted.list" -o "$tmpd/predicted.list"
+
+        # base64 인코딩 (GNU/BSD 차이 고려)
+        if command -v base64 >/dev/null 2>&1; then
+          if base64 --help 2>&1 | grep -q -- '-w'; then
+            PREDICTED_LIST_B64="$(base64 -w0 "$tmpd/predicted.list" || true)"
+          else
+            PREDICTED_LIST_B64="$(base64 < "$tmpd/predicted.list" | tr -d '\n' || true)"
+          fi
+        fi
+      }
+
+      # [ADD-commit.log] 원격 LIVE에서 BASE_COMMIT 확보(있으면 skip)
+      fetch_base_commit_from_remote_live
+      
+      #  로컬 git diff 예측 리스트 생성
+      build_predicted_list_b64
+
+      # [ADD-commit.log] 현재 커밋 SHA 계산(원격 commit.log에 기록용)
+      if [ -n "${CI_COMMIT_SHA:-}" ]; then
+        CURRENT_COMMIT_SHA="$CI_COMMIT_SHA"
+      elif command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        CURRENT_COMMIT_SHA="$(git rev-parse --verify HEAD 2>/dev/null || echo "")"
+      else
+        CURRENT_COMMIT_SHA=""
+      fi
+
+      remote_script=$(mktemp /tmp/remote_diff_deploy.XXXXXX)
+      log "Created temporary diff deploy script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+
+      #!/usr/bin/env bash
+      set -eu
+
+      # ───────────────────────────────────────────────
+      # 공통 유틸 함수
+      # ───────────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      need() { command -v "$1" >/dev/null 2>&1; }
+      ts()   { date +%Y%m%d%H%M%S; }
+      restorecon_if_available() {
+        local p="$1"
+        if command -v restorecon >/dev/null 2>&1; then
+          sudo restorecon -R "$p" >/dev/null 2>&1 || true
+        fi
+      }
+
+      # 파일 타입 검사 도우미
+      is_link() { sudo test -L "$1"; }
+      is_dir()  { sudo test -d "$1"; }
+      is_any()  { sudo test -e "$1" || sudo test -L "$1"; }
+
+      # ───────────────────────────────────────────────
+      # require_envs()
+      # 환경 변수 필수값 확인
+      # ───────────────────────────────────────────────
+      require_envs() {
+        : "${REMOTE_DIR:?REMOTE_DIR is required}"
+        : "${COMMIT_TAG:?COMMIT_TAG is required}"
+        : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+        : "${WEBAPPS_ROOT:?WEBAPPS_ROOT is required}"
+        : "${RELEASES_BASE:?RELEASES_BASE is required}"
+        : "${ARTIFACTS_BASE:?ARTIFACTS_BASE is required}"
+        : "${TOMCAT_SERVICE:?TOMCAT_SERVICE is required}"
+        : "${KEEP_RELEASES:?KEEP_RELEASES is required}"
+        : "${HEALTH_MODE:?HEALTH_MODE is required}"
+        : "${HC_TIMEOUT:?HC_TIMEOUT is required}"
+        : "${HC_INTERVAL:?HC_INTERVAL is required}"
+        : "${NEXUS_USER:?NEXUS_USER is required}"
+        : "${NEXUS_PASS:?NEXUS_PASS is required}"
+        : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+        : "${GROUP_ID:?GROUP_ID is required}"
+        : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+        : "${SAFE_FILTER_MODE:-static}"
+        : "${CURRENT_COMMIT_SHA:=}"
+        : "${BASE_COMMIT:=}"
+        : "${ARTIFACT_USER:?ARTIFACT_USER is required}"
+        : "${ARTIFACT_GROUP:?ARTIFACT_GROUP is required}"
+      }
+
+      # ───────────────────────────────────────────────
+      # ensure_tools()
+      # 필수 도구 설치 확인 (rsync, unzip 등)
+      # ───────────────────────────────────────────────
+      ensure_tools() {
+        for t in rsync ln readlink zip awk sed grep sort uniq curl unzip mktemp df ls tee realpath base64; do
+          if ! need "$t"; then
+            if   need apk; then
+              sudo apk add --no-cache coreutils "$t" || true
+            elif need apt-get; then
+              sudo apt-get update -y && sudo apt-get install -y "$t" || true
+            elif need dnf; then
+              sudo dnf install -y "$t" || true
+            fi
+          fi
+        done
+      }
+
+      # ───────────────────────────────────────────────
+      # setup_context()
+      # 디렉터리 및 배포 경로 설정
+      # ───────────────────────────────────────────────
+      setup_context() {
+        APP_NAME="${CONTEXT_PATH#/}"
+        DEPLOY_VERSION="${COMMIT_TAG#v}"
+
+        LIVE_LINK="${WEBAPPS_ROOT%/}/$APP_NAME"
+        APP_RELEASES_DIR="${RELEASES_BASE%/}/$APP_NAME"
+        NEW_DIR="${ARTIFACTS_BASE%/}/$APP_NAME/$APP_NAME-$DEPLOY_VERSION"
+
+        ART_DIR="$REMOTE_DIR/artifacts"
+        OUT_ZIP="$ART_DIR/diff-deploy-artifacts.zip"
+
+        sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
+      }
+
+      # ───────────────────────────────────────────────
+      # maybe_fetch_new_dir()
+      # NEW_DIR이 없을 경우 Nexus에서 WAR 자동 다운로드 및 unzip
+      # ───────────────────────────────────────────────
+      maybe_fetch_new_dir() {
+        if [ -d "$NEW_DIR" ]; then
+          log "기존 NEW_DIR 사용: $NEW_DIR"
+          return
+        fi
+        log "NEW_DIR 없음 → Nexus에서 자동 생성"
+        APP_PATH="${GROUP_ID//.//}/${ARTIFACT_ID}/${DEPLOY_VERSION}"
+        NEW_WAR="${ARTIFACT_ID}-${DEPLOY_VERSION}.war"
+        NEW_URL="${RELEASE_REPO_URL%/}/${APP_PATH}/${NEW_WAR}"
+        TMP_DIR=$(sudo mktemp -d /tmp/${APP_NAME}-${DEPLOY_VERSION}-fetch.XXXXXX)
+
+        sudo curl -fsSL -u "$NEXUS_USER:$NEXUS_PASS" -o "$TMP_DIR/$NEW_WAR" "$NEW_URL"
+        sudo unzip -q "$TMP_DIR/$NEW_WAR" -d "$TMP_DIR/unzip"
+        sudo test -d "$TMP_DIR/unzip/WEB-INF" || fail "WAR 구조 이상"
+        sudo mkdir -p "$(dirname "$NEW_DIR")"
+        sudo rm -rf "$NEW_DIR"
+        sudo mv "$TMP_DIR/unzip" "$NEW_DIR"
+        sudo rm -rf "$TMP_DIR"
+        ok "NEW_DIR 생성 완료: $NEW_DIR"
+      }
+
+      # ───────────────────────────────────────────────
+      # resolve_base_from_live()
+      # LIVE 심볼릭 링크에서 BASE_DIR 추출 또는 초기화
+      # ───────────────────────────────────────────────
+      resolve_base_from_live() {
+        prev_target=""
+        if is_link "$LIVE_LINK"; then
+          prev_target="$(sudo readlink -f "$LIVE_LINK" || true)"
+        elif is_dir "$LIVE_LINK"; then
+          seed="${APP_RELEASES_DIR}/diff-legacy-backup-$(ts)"
+          log "LIVE_DIR 기반 초기 백업 생성 → $seed"
+          sudo rsync -rlpgoDc --delete --exclude='_logs/**' "${LIVE_LINK%/}/" "${seed%/}/" || true
+          prev_target="$seed"
+
+          log "LIVE_DIR 제거 후 seed로 심링크 전환"
+          sudo rm -rf --one-file-system "$LIVE_LINK"
+          sudo ln -sT "$seed" "$LIVE_LINK" || true
+        else
+          log "LIVE_LINK가 없음 → 신규 서비스로 간주, 초기화 모드 실행"
+          seed="${APP_RELEASES_DIR}/diff-initial-${APP_NAME}-$(ts)"
+          sudo mkdir -p "$seed"
+          sudo cp -a "${NEW_DIR%/}/." "$seed/"
+          prev_target="$seed"
+          sudo ln -sT "$seed" "$LIVE_LINK"
+
+          ok "신규 서비스 초기화 완료: $seed"
+        fi
+
+        BASE_DIR="$(sudo readlink -f "$LIVE_LINK" || true)"
+        [ -n "$BASE_DIR" ] || fail "BASE_DIR 확인 실패"
+        [ -n "$prev_target" ] || prev_target="$BASE_DIR"
+      }
+
+      # ───────────────────────────────────────────────
+      # prepare_target_from_prev()
+      # 이전 릴리스 복제 후 TARGET 디렉터리 생성
+      # ───────────────────────────────────────────────
+      prepare_target_from_prev() {
+        stamp="$(ts)"
+        TARGET="${APP_RELEASES_DIR}/diff-${APP_NAME}-${DEPLOY_VERSION}-${stamp}"
+        log "새 TARGET 생성: $TARGET"
+
+        # 러너 UID/GID (파일/디렉터리 소유권에 사용)
+        RUN_UID="$ARTIFACT_USER"
+        RUN_GID="$ARTIFACT_GROUP"
+
+        # TARGET 만들고 이전 스냅샷 복사
+        sudo mkdir -p "$TARGET"
+        sudo rsync -rlpgoDc --delete --exclude='_logs/**' "${prev_target%/}/" "${TARGET%/}/" || true
+
+        #  _logs 디렉터리 초기화 
+        LOG_DIR="${TARGET%/}/_logs"
+        sudo rm -rf "$LOG_DIR"
+        sudo mkdir -p "$LOG_DIR"
+        sudo chown "$RUN_UID:$RUN_GID" "$LOG_DIR"
+        sudo chmod 0755 "$LOG_DIR"
+
+        # 로그/산출물 파일 경로 정의
+        DIFF_BASE_FILE="$LOG_DIR/diff-base.env"
+        LIVE_POINTER_FILE="$LOG_DIR/live-pointer.env"
+        CHANGED_LIST="$LOG_DIR/changed-files.txt"
+        DELETE_LIST="$LOG_DIR/deleted-files.txt"
+        RSYNC_FILTER="$LOG_DIR/rsync.filter"
+        RSYNC_RAW_OUT="$LOG_DIR/rsync.out"
+        RSYNC_PATHS="$LOG_DIR/rsync.paths"
+        REPORT_TXT="$LOG_DIR/report.txt"
+        PRED_LIST="$LOG_DIR/predicted.list"
+
+        printf '' | tee "$CHANGED_LIST" >/dev/null
+        printf '' | tee "$DELETE_LIST"  >/dev/null
+        printf '' | tee "$DIFF_BASE_FILE" >/dev/null
+        printf '' | tee "$RSYNC_FILTER" >/dev/null
+        printf '' | tee "$RSYNC_RAW_OUT" >/dev/null
+        printf '' | tee "$RSYNC_PATHS"   >/dev/null
+        printf '' | tee "$REPORT_TXT"    >/dev/null
+        printf '' | tee "$PRED_LIST"     >/dev/null
+
+        sudo chmod 0755 "$CHANGED_LIST"
+        sudo chmod 0755 "$DELETE_LIST"
+        sudo chmod 0755 "$DIFF_BASE_FILE"
+        sudo chmod 0755 "$RSYNC_FILTER"
+        sudo chmod 0755 "$RSYNC_RAW_OUT"
+        sudo chmod 0755 "$RSYNC_PATHS"
+        sudo chmod 0755 "$REPORT_TXT"
+        sudo chmod 0755 "$PRED_LIST"
+
+        printf 'BASE_DIR=%s\n' "$(printf %s "$BASE_DIR")" | tee "$DIFF_BASE_FILE" >/dev/null
+
+        if [ -n "${PREDICTED_LIST_B64:-}" ]; then
+          echo "$PREDICTED_LIST_B64" | base64 -d | tee "$LOG_DIR/predicted.list" >/dev/null || true
+        fi
+      }
+
+      # ───────────────────────────────────────────────
+      # [ADD] 필터 생성 (SAFE_FILTER_MODE=static|dynamic|none)
+      # ───────────────────────────────────────────────
+      make_filter_if_enabled() {
+        case "${SAFE_FILTER_MODE:-static}" in
+          none|"") return 0 ;;
+          static)
+            sudo printf '%s\n' \
+            '+ /WEB-INF/classes/***' \
+            '+ /WEB-INF/lib/***' \
+            '+ *.jsp' \
+            '+ *.jspf' \
+            '+ *.jspx' \
+            '+ *.tag' \
+            '+ *.tagx' \
+            '+ *.tld' \
+            '+ /WEB-INF/**/*.jsp' \
+            '+ /WEB-INF/**/*.jspf' \
+            '+ /WEB-INF/**/*.jspx' \
+            '+ /WEB-INF/**/*.tag' \
+            '+ /WEB-INF/**/*.tagx' \
+            '+ /WEB-INF/**/*.tld' \
+            '+ *.html' \
+            '+ *.htm' \
+            '+ *.css' \
+            '+ *.js' \
+            '+ *.png' \
+            '+ *.jpg' \
+            '+ *.jpeg' \
+            '+ *.gif' \
+            '+ *.svg' \
+            '+ *.webp' \
+            '+ favicon.ico' \
+            '+ *.xml' \
+            '+ *.properties' \
+            '+ *.yml' \
+            '+ *.yaml' \
+            '+ MANIFEST.MF' \
+            '+ /META-INF/resources/***' \
+            '- *' \
+            | sudo tee "$RSYNC_FILTER" >/dev/null
+            ;;
+          dynamic)
+            sudo printf '%s\n' \
+            '+ /WEB-INF/classes/***' \
+            '+ /WEB-INF/lib/***' \
+            '+ /META-INF/***' \
+            '+ /BOOT-INF/***' \
+            '+ /static/***' \
+            '+ /public/***' \
+            '+ /assets/***' \
+            '+ /resources/***' \
+            '+ *.css' \
+            '+ *.js' \
+            '+ *.mjs' \
+            '+ *.map' \
+            '+ *.json' \
+            '+ *.html' \
+            '+ *.htm' \
+            '+ *.png' \
+            '+ *.jpg' \
+            '+ *.jpeg' \
+            '+ *.gif' \
+            '+ *.svg' \
+            '+ *.webp' \
+            '+ *.jsp' \
+            '+ *.jspf' \
+            '+ *.jspx' \
+            '+ *.tag' \
+            '+ *.tagx' \
+            '+ *.tld' \
+            '+ *.xhtml' \
+            '+ /WEB-INF/**/*.jsp' \
+            '+ /WEB-INF/**/*.jspf' \
+            '+ /WEB-INF/**/*.jspx' \
+            '+ /WEB-INF/**/*.tag' \
+            '+ /WEB-INF/**/*.tagx' \
+            '+ /WEB-INF/**/*.tld' \
+            '+ /WEB-INF/**/*.xhtml' \
+            '+ *.xml' \
+            '+ *.properties' \
+            '+ *.yml' \
+            '+ *.yaml' \
+            '+ *.ini' \
+            '+ *.conf' \
+            '+ *.cfg' \
+            '+ *.env' \
+            '+ *.txt' \
+            '+ *.csv' \
+            '+ *.tsv' \
+            '+ *.json5' \
+            '+ *.ftl' \
+            '+ *.vm' \
+            '+ *.mustache' \
+            '+ *.hbs' \
+            '+ /templates/***' \
+            '+ /views/***' \
+            '+ MANIFEST.MF' \
+            '+ application.properties' \
+            '+ application.yml' \
+            '+ application.yaml' \
+            '+ logback*.xml' \
+            '+ logging*.xml' \
+            '+ context*.xml' \
+            '+ web.xml' \
+            '+ robots.txt' \
+            '+ sitemap.xml' \
+            '+ favicon.ico' \
+            '+ .well-known/***' \
+            '+ /META-INF/resources/***' \
+            '- *' \
+            | sudo tee "$RSYNC_FILTER" >/dev/null
+            ;;
+          *) :;;
+        esac
+      }
+
+      # ───────────────────────────────────────────────
+      # compute_diff_lists()
+      # rsync dry-run 결과를 기반으로 변경/삭제 파일 목록 계산
+      # ───────────────────────────────────────────────
+      compute_diff_lists() {
+        log "Rsync dry-run 실행 중 (NEW vs BASE)"
+      
+        make_filter_if_enabled
+      
+        # 공통 exclude (로그/임시파일 등)
+        common_excludes=(--exclude='_logs' --exclude='_logs/**' \
+                         --exclude='*.bad' --exclude='*.tmp' --exclude='*.bak' \
+                         --exclude='*.swp' --exclude='*.log')
+      
+        # rsync dry-run → RAW_OUT (읽기는 sudo, 쓰기는 러너 소유/권한으로 tee)
+        if [ -f "$RSYNC_FILTER" ]; then
+          sudo rsync -rlDic --delete --dry-run --out-format='%i %n' \
+            --filter="merge $RSYNC_FILTER" \
+            "${common_excludes[@]}" \
+            "${NEW_DIR%/}/" "${BASE_DIR%/}/" | tee "$RSYNC_RAW_OUT" >/dev/null
+        else
+          sudo rsync -rlDic --delete --dry-run --out-format='%i %n' \
+            "${common_excludes[@]}" \
+            "${NEW_DIR%/}/" "${BASE_DIR%/}/" | tee "$RSYNC_RAW_OUT" >/dev/null
+        fi
+      
+        # 경로만 추출(디렉터리 제거) → rsync.paths  (sudo 불필요: _logs는 러너 소유)
+        awk '{sub(/^[^ ]+[ ]+/,""); print}' "$RSYNC_RAW_OUT" \
+          | sed -e 's#^\.\/##' -e '/\/$/d' \
+          | sort -u | tee "$RSYNC_PATHS" >/dev/null || true
+      
+        # 삭제/변경 파일 목록 초기화 (리다이렉션 대신 tee 사용으로 안전)
+        echo -n | tee "$CHANGED_LIST" >/dev/null
+        echo -n | tee "$DELETE_LIST"  >/dev/null
+      
+        # RAW_OUT 파싱해서 삭제/변경 분리
+        while IFS= read -r ln || [ -n "${ln:-}" ]; do
+          # 삭제
+          if [[ "$ln" == *"deleting "* ]]; then
+            f="${ln#*deleting }"
+            printf '%s\n' "$f" | tee -a "$DELETE_LIST" >/dev/null
+            continue
+          fi
+          # 코드 / 경로 분리
+          code="${ln%% *}"
+          f="${ln#* }"
+          [[ "$f" == */ ]] && continue
+      
+          # 파일 전송/생성/속성변경 포함
+          case "$code" in
+            ">f"*)   printf '%s\n' "$f" | tee -a "$CHANGED_LIST" >/dev/null ;; # 새로 전송
+            ".f"*)   printf '%s\n' "$f" | tee -a "$CHANGED_LIST" >/dev/null ;; # 속성만 변경
+            c[fps]*) printf '%s\n' "$f" | tee -a "$CHANGED_LIST" >/dev/null ;; # cf/cp/cs 등
+            *)       : ;;
+          esac
+        done < "$RSYNC_RAW_OUT"
+      
+        # [ADD] git 예상 vs rsync 결과 교차 비교
+        if [ -s "$LOG_DIR/predicted.list" ]; then
+          sort -u "$LOG_DIR/predicted.list" -o "$LOG_DIR/predicted.list"
+          comm -12 "$LOG_DIR/predicted.list" "$RSYNC_PATHS"       | tee "$LOG_DIR/intersection.txt"        >/dev/null || true
+          comm -23 "$LOG_DIR/predicted.list" "$RSYNC_PATHS"       | tee "$LOG_DIR/missing.from.rsync.txt"  >/dev/null || true
+          comm -13 "$LOG_DIR/predicted.list" "$RSYNC_PATHS"       | tee "$LOG_DIR/extra.in.rsync.txt"      >/dev/null || true
+        else
+          echo -n | tee "$LOG_DIR/intersection.txt"        >/dev/null
+          echo -n | tee "$LOG_DIR/missing.from.rsync.txt"  >/dev/null
+          echo -n | tee "$LOG_DIR/extra.in.rsync.txt"      >/dev/null
+        fi
+      
+        # 출력 유틸 (sudo 없이 안전하게)
+        _lines_or_zero() { [ -r "$1" ] && wc -l < "$1" 2>/dev/null || echo 0; }
+        _head_opt()      { [ -r "$1" ] && head -n "${2:-30}" "$1" || true; }
+      
+        # [ADD] 프리뷰 리포트 출력 (_logs/report.txt)
+        {
+          echo "=== Diff Deploy Preview Report ==="
+          echo "Version   : $DEPLOY_VERSION"
+          echo "Context   : $APP_NAME"
+          echo "Base Dir  : $BASE_DIR"
+          echo "New Dir   : $NEW_DIR"
+          echo "Filter    : ${SAFE_FILTER_MODE:-static}"
+          echo
+      
+          echo "[GIT DIFF 예상 변경 개수]"
+          _lines_or_zero "$LOG_DIR/predicted.list"
+          _head_opt "$LOG_DIR/predicted.list" 30
+          echo
+      
+          echo "[rsync --dry-run 파일 변경 개수]"
+          _lines_or_zero "$RSYNC_PATHS"
+          _head_opt "$RSYNC_PATHS" 30
+          echo
+      
+          echo "[교집합] git 예상 ∩ rsync"
+          _head_opt "$LOG_DIR/intersection.txt" 30
+          echo
+      
+          echo "[MISSING] git 변경에는 있지만 rsync 없음"
+          _head_opt "$LOG_DIR/missing.from.rsync.txt" 30
+          echo
+      
+          echo "[EXTRA] rsync에는 있지만 예상에 없음"
+          _head_opt "$LOG_DIR/extra.in.rsync.txt" 30
+          echo
+      
+          echo "[삭제 건수]"
+          _lines_or_zero "$DELETE_LIST"
+          echo "[변경/생성 건수]"
+          _lines_or_zero "$CHANGED_LIST"
+        } | tee "$REPORT_TXT" >/dev/null
+      
+        log "프리뷰 리포트: $REPORT_TXT"
+      }
+
+      # ───────────────────────────────────────────────
+      # apply_deletions()
+      # DELETE_LIST 기반 안전 삭제 (심볼릭 링크는 링크 자체만 제거)
+      # ───────────────────────────────────────────────
+      apply_deletions() {
+        local target="$1" list="$2"
+
+        log "apply_deletions1"
+
+        # 대상 디렉터리 실경로(보안상 정규화)
+        local rp_tgt
+        rp_tgt="$(sudo realpath -m -- "$target")" || return 0
+
+        # 리스트 읽어서 절대경로 기준으로 삭제
+        while IFS= read -r rel || [[ -n "${rel:-}" ]]; do
+          [[ -z "$rel" ]] && continue
+          # 위험 경로 차단
+          if [[ "$rel" = /* || "$rel" = *".."* ]]; then
+            echo "[SKIP] 위험 경로: $rel"
+            continue
+          fi
+          abs="$rp_tgt/$rel"
+          if sudo test -L "$abs"; then
+            echo "[DEL] (symlink) $rel"
+            sudo rm -f -- "$abs"
+          elif sudo test -e "$abs"; then
+            echo "[DEL] $rel"
+            sudo rm -rf --one-file-system -- "$abs"
+          fi
+        done < "$list"
+
+        log "apply_deletions2"
+      }
+
+      # ───────────────────────────────────────────────
+      # apply_changes()
+      # CHANGED_LIST 기반으로 변경 파일만 복사
+      # ───────────────────────────────────────────────
+      apply_changes() {
+        if [ -s "$CHANGED_LIST" ]; then
+          # # [FIX] 내용만 갱신하고, 기존 소유자/그룹/권한은 유지 (-o -g -p 제거)
+          sudo rsync -rlDic --files-from="$CHANGED_LIST" "${NEW_DIR%/}/" "${TARGET%/}/"
+        fi
+      }
+
+      # ───────────────────────────────────────────────
+      # switch_live_symlink()
+      # LIVE 심볼릭 링크를 새 TARGET으로 전환
+      # ───────────────────────────────────────────────
+      switch_live_symlink() {
+        tmp_link="${LIVE_LINK}.new.$(ts)"
+        sudo ln -sT "$TARGET" "$tmp_link" || sudo ln -s "$TARGET" "$tmp_link"
+        sudo mv -Tf "$tmp_link" "$LIVE_LINK" 2>/dev/null || {
+          sudo rm -rf --one-file-system "$LIVE_LINK"
+          sudo mv "$tmp_link" "$LIVE_LINK"
+        }
+        log "LIVE → $TARGET 전환 완료"
+      }
+
+      # ───────────────────────────────────────────────
+      # update_live_pointer()
+      # 심링크 교체후에 라이브 포인터 정보 재기록
+      # ───────────────────────────────────────────────
+      update_live_pointer() {
+        local current="$TARGET"
+        local prev="$prev_target"   # BASE_DIR로 기록하고 싶으면 prev="$BASE_DIR"
+        sudo sh -c "printf 'CURRENT=%s\nPREV=%s\n' '$current' '${prev:-}' > '$TARGET/_logs/live-pointer.env'"
+      }
+
+      # ───────────────────────────────────────────────
+      # reload_or_restart_tomcat()
+      # Tomcat 핫리로드 or 재기동 처리
+      # ───────────────────────────────────────────────
+      reload_or_restart_tomcat() {
+        if [ "$HOT_RELOAD" = "true" ] && [ -n "$DEPLOY_USER" ]; then
+          sudo curl -fsS -u "$DEPLOY_USER:$DEPLOY_PASS" "http://$WAS_URL/manager/text/reload?path=/${APP_NAME}" || true
+        else
+          sudo systemctl reload "$TOMCAT_SERVICE" 2>/dev/null || sudo systemctl restart "$TOMCAT_SERVICE"
+        fi
+      }
+
+      # ───────────────────────────────────────────────
+      # do_healthcheck()
+      # 배포 후 서비스 정상 응답 확인
+      # ───────────────────────────────────────────────
+      do_healthcheck() {
+        case "$HEALTH_MODE" in
+          actuator) hc_url="http://127.0.0.1:8080/${APP_NAME}/actuator/health" ;;
+          page)     hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
+          none)     return ;;
+          *)        hc_url="http://127.0.0.1:8080/${APP_NAME}/" ;;
+        esac
+
+        elapsed=0
+        while [ "$elapsed" -lt "$HC_TIMEOUT" ]; do
+          if sudo curl -fsS --max-time 3 "$hc_url" >/dev/null 2>&1; then
+            ok "헬스체크 성공: $hc_url"
+            return
+          fi
+          sleep "$HC_INTERVAL"; elapsed=$((elapsed+HC_INTERVAL))
+        done
+        fail "헬스체크 실패: $hc_url"
+      }
+
+      # ───────────────────────────────────────────────
+      # prune_releases()
+      # KEEP_RELEASES 초과 버전 정리
+      # ───────────────────────────────────────────────
+      prune_releases() {
+        mapfile -t snaps < <(sudo ls -1dt "${APP_RELEASES_DIR}/diff-${APP_NAME}-"* 2>/dev/null || true)
+        if [ "${#snaps[@]}" -gt "$KEEP_RELEASES" ]; then
+          for ((i=KEEP_RELEASES; i<${#snaps[@]}; i++)); do
+            [ "${snaps[$i]}" = "$TARGET" ] && continue
+            sudo rm -rf --one-file-system "${snaps[$i]}" || true
+          done
+        fi
+      }
+
+      # ───────────────────────────────────────────────
+      # package_artifacts()
+      # 로그, 목록 파일 등을 ZIP으로 압축
+      # ───────────────────────────────────────────────
+      package_artifacts() {
+        sudo cp -f "$DIFF_BASE_FILE" "$ART_DIR/diff-base.env" || true
+        sudo cp -f "$CHANGED_LIST" "$ART_DIR/changed-files.txt" || true
+        sudo cp -f "$DELETE_LIST" "$ART_DIR/deleted-files.txt" || true
+        # [ADD] 프리뷰 산출물도 같이 담기
+        sudo cp -f "$RSYNC_RAW_OUT" "$ART_DIR/rsync.out" 2>/dev/null || true
+        sudo cp -f "$RSYNC_PATHS" "$ART_DIR/rsync.paths" 2>/dev/null || true
+        sudo cp -f "$REPORT_TXT" "$ART_DIR/report.txt" 2>/dev/null || true
+        sudo cp -f "$RSYNC_FILTER" "$ART_DIR/rsync.filter" 2>/dev/null || true
+        # [ADD] git diff 비교 산출물
+        sudo cp -f "$LOG_DIR/predicted.list" "$ART_DIR/predicted.list" 2>/dev/null || true
+        sudo cp -f "$LOG_DIR/intersection.txt" "$ART_DIR/intersection.txt" 2>/dev/null || true
+        sudo cp -f "$LOG_DIR/missing.from.rsync.txt" "$ART_DIR/missing.from.rsync.txt" 2>/dev/null || true
+        sudo cp -f "$LOG_DIR/extra.in.rsync.txt" "$ART_DIR/extra.in.rsync.txt" 2>/dev/null || true
+
+        {
+          echo "DEPLOYED_VERSION=$DEPLOY_VERSION"
+          echo "LIVE_LINK=$LIVE_LINK"
+          echo "TARGET=$TARGET"
+          echo "BASE_DIR=$BASE_DIR"
+        } | sudo tee "$ART_DIR/.env" >/dev/null
+
+        ( cd "$ART_DIR" && zip -r "$(basename "$OUT_ZIP")" .env *.txt rsync.* *.list >/dev/null 2>&1 || true )
+        ok "배포 로그 ZIP 생성 완료"
+        echo "$OUT_ZIP"
+      }
+
+      # [ADD-commit.log] ─────────────────────────────────────────────
+      # ───────────────────────────────────────────────
+      # [NEW] 함수: write_pre_deploy_commit_log_if_missing
+      # 목적:
+      #   - BASE_COMMIT 값이 있을 경우,
+      #     LIVE 디렉터리에 commit.log가 없으면 자동으로 생성
+      #   - 기존 commit.log가 있거나 BASE_COMMIT이 비어 있으면 아무 작업 안 함
+      # ───────────────────────────────────────────────
+      write_pre_deploy_commit_log_if_missing() {
+        # BASE_COMMIT이 없으면 스킵
+        if [ -z "${BASE_COMMIT:-}" ]; then
+          log "[PRE-DEPLOY] BASE_COMMIT 미설정 → commit.log 기록 생략"
+          return 0
+        fi
+      
+        # LIVE 실경로 추적 (심링크 or 디렉터리)
+        local live_real=""
+        if sudo test -L "$LIVE_LINK"; then
+          live_real="$(sudo readlink -f "$LIVE_LINK" 2>/dev/null || true)"
+        elif sudo test -d "$LIVE_LINK"; then
+          live_real="$LIVE_LINK"
+        fi
+      
+        # 유효한 LIVE가 없으면 스킵
+        if [ -z "$live_real" ] || ! sudo test -d "$live_real"; then
+          log "[PRE-DEPLOY] LIVE 디렉터리 없음 → commit.log 기록 생략"
+          return 0
+        fi
+      
+        # 이미 commit.log가 존재하면 스킵
+        local logf="$live_real/_logs/commit.log"
+        if sudo test -f "$logf"; then
+          log "[PRE-DEPLOY] 기존 commit.log 존재 → skip ($logf)"
+          return 0
+        fi
+      
+        # 생성
+        sudo mkdir -p "$live_real/_logs"
+        sudo sh -c "printf 'COMMIT=%s\nDATE=%s\nNOTE=base_commit_predeploy\n' \
+          \"$BASE_COMMIT\" \"\$(date -Iseconds)\" > '$logf'"
+        log "[PRE-DEPLOY] commit.log 생성 완료: $logf (COMMIT=$BASE_COMMIT)"
+      }
+      
+      write_commit_log() {
+        # diff-deploy는 TARGET 디렉터리가 최종 LIVE가 됨
+        local file="$TARGET/_logs/commit.log"
+        sudo mkdir -p "$(dirname "$file")"
+        sudo sh -c "printf 'COMMIT=%s\nTAG=%s\nVERSION=%s\nDATE=%s\n' \
+          \"$CURRENT_COMMIT_SHA\" \"$COMMIT_TAG\" \"$DEPLOY_VERSION\" \"\$(date -Iseconds)\" > \"$file\""
+        log "Wrote commit info to ${file}" 
+      }
+
+      # ────────────────────────────────────────────────
+
+      main() {
+        require_envs
+        log "require_envs 완료"
+        ensure_tools
+        log "ensure_tools 완료"
+        setup_context
+        log "setup_context 완료"
+        maybe_fetch_new_dir
+        log "maybe_fetch_new_dir 완료"
+        resolve_base_from_live
+        log "resolve_base_from_live 완료"
+        write_pre_deploy_commit_log_if_missing
+        log "write_pre_deploy_commit_log_if_missing 완료"
+        prepare_target_from_prev
+        log "prepare_target_from_prev 완료"
+        compute_diff_lists
+        log "compute_diff_lists 완료"
+        apply_deletions "$TARGET" "$DELETE_LIST"
+        log "apply_deletions 완료"
+        apply_changes
+        log "apply_changes 완료"
+        switch_live_symlink
+        log "switch_live_symlink 완료"
+        reload_or_restart_tomcat
+        log "reload_or_restart_tomcat 완료"
+        do_healthcheck
+        update_live_pointer
+        write_commit_log  # [ADD-commit.log] 배포 후 기록
+        prune_releases
+        package_artifacts
+      }
+
+      main "$@"
+
+    REMOTE_SH
+
+      log "▶ Executing diff deploy via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "COMMIT_TAG='$(shq "$COMMIT_TAG")'" \
+        "CONTEXT_PATH='$(shq "$CONTEXT_PATH")'" \
+        "WEBAPPS_ROOT='$(shq "$webapps_root")'" \
+        "RELEASES_BASE='$(shq "$releases_base")'" \
+        "ARTIFACTS_BASE='$(shq "$artifacts_base")'" \
+        "TOMCAT_SERVICE='$(shq "$tomcat_service")'" \
+        "KEEP_RELEASES='$(shq "$keep_releases")'" \
+        "HEALTH_MODE='$(shq "$health_mode")'" \
+        "HEALTH_URL_OVERRIDE='$(shq "$health_url_override")'" \
+        "HC_TIMEOUT='$(shq "$hc_timeout")'" \
+        "HC_INTERVAL='$(shq "$hc_interval")'" \
+        "HOT_RELOAD='$(shq "$hot_reload")'" \
+        "DEPLOY_USER='$(shq "$deploy_user")'" \
+        "DEPLOY_PASS='$(shq "$deploy_pass")'" \
+        "WAS_URL='$(shq "$was_url")'" \
+        "AUTO_FETCH_ON_MISSING='true'" \
+        "NEXUS_USER='$(shq "$NEXUS_USER")'" \
+        "NEXUS_PASS='$(shq "$NEXUS_PASS")'" \
+        "RELEASE_REPO_URL='$(shq "$RELEASE_REPO_URL")'" \
+        "GROUP_ID='$(shq "$GROUP_ID")'" \
+        "ARTIFACT_ID='$(shq "$ARTIFACT_ID")'" \
+        "SAFE_FILTER_MODE='$(shq "$SAFE_FILTER_MODE")'" \
+        "PREDICTED_LIST_B64='$(shq "$PREDICTED_LIST_B64")'" \
+        "CURRENT_COMMIT_SHA='$(shq "${CURRENT_COMMIT_SHA:-}")'" \
+        "BASE_COMMIT='$(shq "${BASE_COMMIT:-}")'" \
+        "ARTIFACT_USER='$(shq "$ARTIFACT_USER")'" \
+        "ARTIFACT_GROUP='$(shq "$ARTIFACT_GROUP")'" \
+        'export REMOTE_DIR COMMIT_TAG CONTEXT_PATH WEBAPPS_ROOT RELEASES_BASE ARTIFACTS_BASE TOMCAT_SERVICE KEEP_RELEASES HEALTH_MODE HEALTH_URL_OVERRIDE HC_TIMEOUT HC_INTERVAL HOT_RELOAD DEPLOY_USER DEPLOY_PASS WAS_URL AUTO_FETCH_ON_MISSING NEXUS_USER NEXUS_PASS RELEASE_REPO_URL GROUP_ID ARTIFACT_ID SAFE_FILTER_MODE PREDICTED_LIST_B64 CURRENT_COMMIT_SHA BASE_COMMIT ARTIFACT_USER ARTIFACT_GROUP; bash -s' \
+        < "$remote_script" | tee /tmp/_diff_deploy_out.txt
+
+      remote_zip_path="$(tail -n1 /tmp/_diff_deploy_out.txt || true)"
+      [ -z "$remote_zip_path" ] && remote_zip_path="${REMOTE_DIR}/artifacts/diff-deploy-artifacts.zip"
+      local_dir="${CI_PROJECT_DIR:-.}/artifacts"
+      mkdir -p "$local_dir"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip_path" "$local_dir/" || true
+
+      rm -f "$remote_script" /tmp/_diff_deploy_out.txt || true
+      ok "Diff deploy finished"
+    }
+
+
 .fn_tomcat_diff_deploy:
   script: |
     fn_tomcat_diff_deploy() {
@@ -1382,6 +3228,8 @@
       #!/usr/bin/env bash
       set -eu
 
+      DEBUG_MODE="${DEBUG_MODE:-false}" 
+
       # ───────────────────────────────────────────────
       # 공통 유틸 함수
       # ───────────────────────────────────────────────
@@ -1390,6 +3238,11 @@
       fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
       need() { command -v "$1" >/dev/null 2>&1; }
       ts()   { date +%Y%m%d%H%M%S; }
+      dbg() {
+        if [ "$DEBUG_MODE" = "true" ]; then
+          printf '[DBG]  %s\n' "$*"
+        fi
+      }
 
       # 파일 타입 검사 도우미
       is_link() { sudo test -L "$1"; }
@@ -1542,7 +3395,7 @@
       # ───────────────────────────────────────────────
       compute_diff_lists() {
         log "Rsync dry-run 실행 중 (NEW vs BASE)"
-        mapfile -t lines < <(sudo rsync -ai --delete --dry-run --out-format='%i %n' \
+        mapfile -t lines < <(sudo rsync -rlDic --delete --dry-run --out-format='%i %n' \
           --exclude='_logs/**' --exclude='*.bad' --exclude='*.tmp' \
           --exclude='*.bak' --exclude='*.swp' --exclude='*.log' \
           "${NEW_DIR%/}/" "${BASE_DIR%/}/")
@@ -1565,25 +3418,36 @@
       # ───────────────────────────────────────────────
       apply_deletions() {
         local target="$1" list="$2"
-        rp_tgt="$(realpath -m -- "$target")"
-        pushd "$rp_tgt" >/dev/null
 
-        while IFS= read -r rel || [[ -n "${rel:-}" ]]; do
+        # 대상 디렉터리 실경로(보안상 정규화)
+        local rp_tgt
+        rp_tgt="$(sudo realpath -m -- "$target")" || return 0
+
+        # 리스트 읽어서 절대경로 기준으로 삭제
+        while IFS= read -r raw || [[ -n "${raw:-}" ]]; do
+          rel="$(printf '%s' "$raw" | sed -e 's/\r$//' -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//' )"
+          rel="${rel#./}"
+
+          # 빈 줄/주석 스킵
           [[ -z "$rel" ]] && continue
+          [[ "$rel" =~ ^# ]] && continue 
+
+          # 위험 경로 차단
           if [[ "$rel" = /* || "$rel" = *".."* ]]; then
-            echo "[SKIP] 위험 경로: $rel"
+            log "  [SKIP] 위험 경로: $rel"
             continue
           fi
-          if [[ -L "$rel" ]]; then
-            echo "[DEL] (symlink) $rel"
-            sudo rm -f -- "$rel"
-          elif [[ -e "$rel" ]]; then
-            echo "[DEL] $rel"
-            sudo rm -rf --one-file-system -- "$rel"
-          fi
-        done < "$list"
 
-        popd >/dev/null
+          abs="$rp_tgt/$rel"
+
+          if sudo test -L "$abs"; then
+            log "[DEL] (symlink) $abs"
+            sudo rm -f -- "$abs"
+          elif sudo test -e "$abs"; then
+            log "[DEL] $abs"
+            sudo rm -rf --one-file-system -- "$abs"
+          fi
+        done < "$list" 
       }
 
       # ───────────────────────────────────────────────
@@ -1591,8 +3455,20 @@
       # CHANGED_LIST 기반으로 변경 파일만 복사
       # ───────────────────────────────────────────────
       apply_changes() {
+        log "[apply_changes] 파일 변경 적용 시작"
+
+        dbg "rsync source=${NEW_DIR%/}/ target=${TARGET%/}/ list=$CHANGED_LIST"    
+
         if [ -s "$CHANGED_LIST" ]; then
-          sudo rsync -a --files-from="$CHANGED_LIST" "${NEW_DIR%/}/" "${TARGET%/}/"
+          sudo rsync -rlDic \
+            --files-from="$CHANGED_LIST" \
+            --ignore-missing-args \
+            --out-format='[SYNC] %i %n' \
+            "${NEW_DIR%/}/" "${TARGET%/}/" | tee "$LOG_DIR/rsync.apply.out"
+
+          ok "[apply_changes] 변경 파일 적용 완료 (로그: $LOG_DIR/rsync.apply.out)"
+        else
+          log "[apply_changes] 변경된 파일 없음 → skip"
         fi
       }
 
@@ -1609,16 +3485,17 @@
         }
         log "LIVE → $TARGET 전환 완료"
       }
-
+      
       # ───────────────────────────────────────────────
       # update_live_pointer()
       # 심링크 교체후에 라이브 포인터 정보 재기록
       # ───────────────────────────────────────────────
       update_live_pointer() {
-        # 현재(LIVE)는 이제 TARGET, 이전은 prev_target (혹은 BASE_DIR)로 기록
         local current="$TARGET"
-        local prev="$prev_target"   # BASE_DIR을 쓰고 싶다면 prev="$BASE_DIR"
+        local prev="$prev_target"   # BASE_DIR로 기록하고 싶으면 prev="$BASE_DIR"
         sudo sh -c "printf 'CURRENT=%s\nPREV=%s\n' '$current' '${prev:-}' > '$TARGET/_logs/live-pointer.env'"
+        uid="$(id -u)"; gid="$(id -g)" 
+        sudo chown "$uid:$gid" "$TARGET/_logs/live-pointer.env"
       }
 
       # ───────────────────────────────────────────────
@@ -1707,6 +3584,7 @@
         switch_live_symlink
         reload_or_restart_tomcat
         do_healthcheck
+        update_live_pointer
         prune_releases
         package_artifacts
       }
@@ -1751,6 +3629,7 @@
       rm -f "$remote_script" /tmp/_diff_deploy_out.txt || true
       ok "Diff deploy finished"
     }
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 함수: fn_tomcat_diff_restore
@@ -2087,13 +3966,6 @@
         fi
       }
 
-      # ── live-pointer.env 업데이트 ────────────────────────
-      update_live_pointer() {
-        if [ -d "$TARGET/_logs" ]; then
-          sudo sh -c "printf 'CURRENT=%s\nPREV=%s\n' '$TARGET' '${CURRENT:-}' > '$TARGET/_logs/live-pointer.env'" || true
-        fi
-      }
-
       # ── 산출물 패키징 ───────────────────────────────────
       package_artifacts() {
         {
@@ -2130,8 +4002,7 @@
         switch_live
         apply_tomcat
         healthcheck
-        mark_bad_if_needed
-        update_live_pointer
+        mark_bad_if_needed 
         package_artifacts
       }
       main "$@"
@@ -2229,6 +4100,8 @@
       : "${NEXUS_USER:?NEXUS_USER is required}"
       : "${NEXUS_PASS:?NEXUS_PASS is required}"
       : "${CONTEXT_PATH:?CONTEXT_PATH is required}"   # 예: /devops
+      : "${ARTIFACT_USER:?ARTIFACT_USER is required}"
+      : "${ARTIFACT_GROUP:?ARTIFACT_GROUP is required}"
 
       # ── 선택 입력(기본값) ───────────────────────────
       remote_port="${REMOTE_DEPLOY_PORT:-22}"
@@ -2251,11 +4124,148 @@
       # 로그/산출물
       deploy_log_name="${DEPLOY_LOG_NAME:-symlink-deploy.log}"
 
+      # [ADD] 프리뷰 필터 모드(정적/동적/해제)
+      SAFE_FILTER_MODE="${SAFE_FILTER_MODE:-static}"
+
+      # [NEW] git diff 기준 커밋(옵션)
+      BASE_COMMIT="${BASE_COMMIT:-}"
+
       # ── 유틸 ─────────────────────────────────────────
       log()  { printf '[INFO] %s\n' "$*"; }
       ok()   { printf '[OK]   %s\n' "$*"; }
       fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
       shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      #######################################################################
+      # 함수: fetch_base_commit_from_remote_live
+      # 목적:
+      #   - 원격 서버의 LIVE 심링크 또는 디렉터리가 가리키는 현재 버전의
+      #     _logs/commit.log 에서 COMMIT 값을 읽어 BASE_COMMIT 변수로 설정
+      # 동작 개요:
+      #   1. SSH로 원격 접속하여 LIVE 실경로 확인 (readlink -f)
+      #   2. commit.log 존재 시 COMMIT= 값 추출
+      #   3. 성공 시 BASE_COMMIT 환경 변수로 export
+      #######################################################################
+      fetch_base_commit_from_remote_live() {
+        : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+        : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+        : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+
+        if [ -n "${BASE_COMMIT:-}" ]; then
+           log "[INFO] BASE_COMMIT 설정됨 → live 에서 읽기 생략"
+        else
+          log "[INFO] BASE_COMMIT 미설정 → live 에서 읽기"
+          local remote_port="${REMOTE_DEPLOY_PORT:-22}"
+          local webapps_root="${TOMCAT_WEBAPPS_DIR:-/opt/tomcat/webapps}"
+          local app_name="${CONTEXT_PATH#/}"
+          local live_link="${webapps_root%/}/${app_name}"
+          local prev_commit=""
+         
+          log "[SSH] 원격 LIVE commit.log 조회 중: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+         
+          prev_commit="$(
+            ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+              "LIVE='$live_link';
+               if sudo test -L \"\$LIVE\"; then REAL=\$(sudo readlink -f \"\$LIVE\" 2>/dev/null || true);
+               elif sudo test -d \"\$LIVE\"; then REAL=\"\$LIVE\";
+               else REAL=\"\"; fi;
+               if [ -n \"\$REAL\" ] && sudo test -f \"\$REAL/_logs/commit.log\"; then
+                 sudo awk -F= '/^COMMIT=/{print \$2}' \"\$REAL/_logs/commit.log\" | tr -d '\r';
+               fi" 2>/dev/null || true
+          )"
+         
+          if [ -n "$prev_commit" ]; then
+            export BASE_COMMIT="$prev_commit"
+            log "[OK] BASE_COMMIT(from remote LIVE): $BASE_COMMIT"
+          else
+            log "[WARN] 원격 LIVE commit.log 없음 → BASE_COMMIT 미설정"
+          fi
+        fi
+      }
+
+
+      #######################################################################
+      # [ADD] 함수: build_predicted_list_b64
+      # 목적:
+      #   - 로컬 git diff를 WAR 내부 경로로 매핑하여 predicted.list 생성 후 base64 인코딩
+      #   - PREDICTED_LIST_B64 변수에 저장, 원격에 전달하여 rsync 결과와 교차 비교
+      #######################################################################
+      build_predicted_list_b64() {
+        PREDICTED_LIST_B64=""
+
+        if ! command -v git >/dev/null 2>&1; then
+          log "[ADD] git 없음 → 예측 목록 생략"
+          return 0
+        fi
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          log "[ADD] .git 미존재 → 예측 목록 생략"
+          return 0
+        fi
+
+        # [NEW] HEAD/CURRENT_COMMIT
+        local head_ref
+        if [ -n "${CI_COMMIT_SHA:-}" ]; then
+          head_ref="$CI_COMMIT_SHA"
+        else
+          head_ref="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+        fi
+        if [ -z "$head_ref" ]; then
+          log "[ADD] HEAD 찾기 실패 → 예측 목록 생략"
+          return 0
+        fi
+
+        # [NEW] BASE_COMMIT이 최종적으로 없으면 예측 스킵
+        local base_ref=""
+        if [ -n "${BASE_COMMIT:-}" ]; then
+          base_ref="$BASE_COMMIT"
+        else
+          log "[ADD] BASE_COMMIT 미설정 → 예측 목록 생략"
+          return 0
+        fi
+        if ! git cat-file -e "$base_ref^{commit}" 2>/dev/null; then
+          log "[ADD] BASE_COMMIT($base_ref) 유효하지 않음 → 예측 목록 생략"
+          return 0
+        fi
+
+        local tmpd base rel
+        tmpd="$(mktemp -d)"
+        # shellcheck disable=SC2064
+        trap "rm -rf '$tmpd'" EXIT
+
+        git diff --name-status "$base_ref" "$head_ref" > "$tmpd/changed.tab" || true
+        : > "$tmpd/predicted.list"
+
+        while IFS=$'\t' read -r _status path || [ -n "${path:-}" ]; do
+          case "$path" in
+            src/main/java/*)
+              base="${path#src/main/java/}"
+              base="${base%.java}"
+              printf 'WEB-INF/classes/%s.class\n' "$base" >> "$tmpd/predicted.list"
+              ;;
+            src/main/resources/*)
+              rel="${path#src/main/resources/}"
+              printf 'WEB-INF/classes/%s\n' "$rel" >> "$tmpd/predicted.list"
+              ;;
+            src/main/webapp/*)
+              printf '%s\n' "${path#src/main/webapp/}" >> "$tmpd/predicted.list"
+              ;;
+            *) :;;
+          esac
+        done < "$tmpd/changed.tab"
+
+        sort -u "$tmpd/predicted.list" -o "$tmpd/predicted.list"
+
+        if command -v base64 >/dev/null 2>&1; then
+          if base64 --help 2>&1 | grep -q -- '-w'; then
+            PREDICTED_LIST_B64="$(base64 -w0 "$tmpd/predicted.list" || true)"
+          else
+            PREDICTED_LIST_B64="$(base64 < "$tmpd/predicted.list" | tr -d '\n' || true)"
+          fi
+        fi
+      }
+
+      fetch_base_commit_from_remote_live
+      build_predicted_list_b64
 
       # ── 원격 스크립트 생성 ───────────────────────────
       remote_script=$(mktemp /tmp/remote_symlink_deploy.XXXXXX)
@@ -2293,6 +4303,8 @@
         : "${RELEASES_BASE:?RELEASES_BASE is required}"
         : "${TOMCAT_SERVICE:?TOMCAT_SERVICE is required}"
         : "${KEEP_RELEASES:?KEEP_RELEASES is required}"
+        : "${ARTIFACT_USER:?ARTIFACT_USER is required}"
+        : "${ARTIFACT_GROUP:?ARTIFACT_GROUP is required}"
 
         : "${HEALTH_MODE:=actuator}"      # actuator|page|none
         : "${HEALTH_URL_OVERRIDE:=}"      # 지정 시 최우선
@@ -2307,9 +4319,17 @@
         : "${BAD_MARKER_NAME:=.bad}"
         : "${MARK_BAD_ON_ROLLBACK:=true}"
 
+        # [ADD]
+        : "${SAFE_FILTER_MODE:=static}"
+        : "${PREDICTED_LIST_B64:=}"
+
+        # [NEW] 현재 배포 커밋 정보(로컬에서 전달)
+        : "${CURRENT_COMMIT_SHA:=}"
+
         APP_NAME="${CONTEXT_PATH#/}"                       # "/devops" → "devops"
         LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
         APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
+        APP_RELEASES_LOGS="${APP_RELEASES_DIR}/_logs"      # [NEW]
         ART_DIR="$REMOTE_DIR/artifacts"
         LOG="$ART_DIR/$DEPLOY_LOG_NAME"
         OUT_ZIP="$ART_DIR/symlink-deploy-artifacts.zip"
@@ -2319,14 +4339,14 @@
         NEW_WAR="${ARTIFACT_ID}-${NEW_VERSION}.war"
         NEW_URL="${BASE_URL}/${NEW_VERSION}/${NEW_WAR}"
 
-        sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR"
-        # 로그 파일 생성/초기화도 sudo로
+        sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR" "$APP_RELEASES_LOGS"
         sudo sh -c ": > \"$LOG\""
       }
 
       # ── 도구 보장 ───────────────────────────────────────
       ensure_tools() {
-        local pkgs=(curl unzip zip ln readlink)
+        # [ADD] rsync/텍스트 유틸 포함
+        local pkgs=(curl unzip zip ln readlink rsync awk sed grep sort uniq tee realpath base64)
 
         for t in "${pkgs[@]}"; do
           if ! need "$t"; then
@@ -2353,25 +4373,47 @@
         done
       }
 
+      ensure_owned_dir() { # $1=dir
+        sudo mkdir -p "$1"
+        sudo chown -R "$ARTIFACT_USER:$ARTIFACT_GROUP" "$1"
+        command -v restorecon >/dev/null 2>&1 && sudo restorecon -R "$1" || true
+      }
+
+      chown_path() { # $1=path
+        sudo chown -R "$ARTIFACT_USER:$ARTIFACT_GROUP" "$1"
+        command -v restorecon >/dev/null 2>&1 && sudo restorecon -R "$1" || true
+      }
+      
       # ── NEW(=새 릴리스) 준비 ────────────────────────────
       prepare_new_version() {
         new_dir="${APP_RELEASES_DIR}/${APP_NAME}-${NEW_VERSION}"
         tmp_dir="${new_dir}.tmp.$$"
 
         log "Download NEW: $NEW_URL"
-        sudo mkdir -p "$tmp_dir"
-        sudo curl -fsS -u "$NEXUS_USER:$NEXUS_PASS" -o "$tmp_dir/$NEW_WAR" "$NEW_URL" | sudo tee -a "$LOG" >/dev/null || true
+        ensure_owned_dir "$tmp_dir"
 
-        sudo unzip -q "$tmp_dir/$NEW_WAR" -d "$tmp_dir/unzip"
+        # WAR 다운로드는 루트로 받아도 OK → 이후 소유권 정리
+        sudo curl -fsS -u "$NEXUS_USER:$NEXUS_PASS" -o "$tmp_dir/$NEW_WAR" "$NEW_URL" \
+          | sudo tee -a "$LOG" >/dev/null || true
+
+        # unzip 은 아티팩트 계정으로 수행 
+        sudo -u "$ARTIFACT_USER" unzip -q "$tmp_dir/$NEW_WAR" -d "$tmp_dir/unzip"
         sudo test -d "$tmp_dir/unzip/WEB-INF" || fail "WAR structure invalid (no WEB-INF)"
 
+        # 새 릴리스 경로 준비 및 전개
         sudo rm -rf "$new_dir"
         sudo mv "$tmp_dir/unzip" "$new_dir"
+
+        # 최종 소유권/SELinux 컨텍스트 정리
+        chown_path "$new_dir"
+
+        # tmp 정리
         sudo rm -rf "$tmp_dir" || true
 
         printf 'NEW_VERSION=%s\n' "$NEW_VERSION" | sudo tee -a "$LOG" >/dev/null
         printf 'NEW_DIR=%s\n' "$new_dir" | sudo tee -a "$LOG" >/dev/null
       }
+
 
       # ── 기존 LIVE → 릴리스로 1회 이관(최초 배포 포함) ─────────
       migrate_live_once() {
@@ -2494,7 +4536,6 @@
             printf '%s\n' "$prev"; return 0
           fi
         fi
-
         # 2) prev_hint (배포 직전 LIVE)
         if [ -n "$prev_hint" ] && sudo test -d "$prev_hint" && ! sudo test -f "$prev_hint/$BAD_MARKER_NAME"; then
           printf '%s\n' "$prev_hint"; return 0
@@ -2532,6 +4573,263 @@
         fi
 
         return 1
+      }
+
+      # ───────────────────────────────────────────────────
+      # [ADD] PREVIEW: BASE_DIR 결정 (LIVE 기준) + 필터 생성
+      # ───────────────────────────────────────────────────
+      resolve_base_for_preview() {
+        BASE_DIR=""
+        if sudo test -L "$LIVE_LINK"; then
+          BASE_DIR="$(sudo readlink -f "$LIVE_LINK" 2>/dev/null || true)"
+        elif sudo test -d "$LIVE_LINK"; then
+          BASE_DIR="$LIVE_LINK"
+        elif [ -n "${prev_target:-}" ] && sudo test -d "$prev_target"; then
+          BASE_DIR="$prev_target"
+        else
+          BASE_DIR=""
+        fi
+      }
+
+      # ───────────────────────────────────────────────
+      # [ADD] 필터 생성 (SAFE_FILTER_MODE=static|dynamic|none)
+      # ───────────────────────────────────────────────
+      make_filter_if_enabled() {
+        case "${SAFE_FILTER_MODE:-static}" in
+          none|"") return 0 ;;
+          static)
+            sudo printf '%s\n' \
+            '+ /WEB-INF/classes/***' \
+            '+ /WEB-INF/lib/***' \
+            '+ *.jsp' \
+            '+ *.jspf' \
+            '+ *.jspx' \
+            '+ *.tag' \
+            '+ *.tagx' \
+            '+ *.tld' \
+            '+ /WEB-INF/**/*.jsp' \
+            '+ /WEB-INF/**/*.jspf' \
+            '+ /WEB-INF/**/*.jspx' \
+            '+ /WEB-INF/**/*.tag' \
+            '+ /WEB-INF/**/*.tagx' \
+            '+ /WEB-INF/**/*.tld' \
+            '+ *.html' \
+            '+ *.htm' \
+            '+ *.css' \
+            '+ *.js' \
+            '+ *.png' \
+            '+ *.jpg' \
+            '+ *.jpeg' \
+            '+ *.gif' \
+            '+ *.svg' \
+            '+ *.webp' \
+            '+ favicon.ico' \
+            '+ *.xml' \
+            '+ *.properties' \
+            '+ *.yml' \
+            '+ *.yaml' \
+            '+ MANIFEST.MF' \
+            '+ /META-INF/resources/***' \
+            '- *' \
+            | sudo tee "$RSYNC_FILTER" >/dev/null
+            ;;
+          dynamic)
+            sudo printf '%s\n' \
+            '+ /WEB-INF/classes/***' \
+            '+ /WEB-INF/lib/***' \
+            '+ /META-INF/***' \
+            '+ /BOOT-INF/***' \
+            '+ /static/***' \
+            '+ /public/***' \
+            '+ /assets/***' \
+            '+ /resources/***' \
+            '+ *.css' \
+            '+ *.js' \
+            '+ *.mjs' \
+            '+ *.map' \
+            '+ *.json' \
+            '+ *.html' \
+            '+ *.htm' \
+            '+ *.png' \
+            '+ *.jpg' \
+            '+ *.jpeg' \
+            '+ *.gif' \
+            '+ *.svg' \
+            '+ *.webp' \
+            '+ *.jsp' \
+            '+ *.jspf' \
+            '+ *.jspx' \
+            '+ *.tag' \
+            '+ *.tagx' \
+            '+ *.tld' \
+            '+ *.xhtml' \
+            '+ /WEB-INF/**/*.jsp' \
+            '+ /WEB-INF/**/*.jspf' \
+            '+ /WEB-INF/**/*.jspx' \
+            '+ /WEB-INF/**/*.tag' \
+            '+ /WEB-INF/**/*.tagx' \
+            '+ /WEB-INF/**/*.tld' \
+            '+ /WEB-INF/**/*.xhtml' \
+            '+ *.xml' \
+            '+ *.properties' \
+            '+ *.yml' \
+            '+ *.yaml' \
+            '+ *.ini' \
+            '+ *.conf' \
+            '+ *.cfg' \
+            '+ *.env' \
+            '+ *.txt' \
+            '+ *.csv' \
+            '+ *.tsv' \
+            '+ *.json5' \
+            '+ *.ftl' \
+            '+ *.vm' \
+            '+ *.mustache' \
+            '+ *.hbs' \
+            '+ /templates/***' \
+            '+ /views/***' \
+            '+ MANIFEST.MF' \
+            '+ application.properties' \
+            '+ application.yml' \
+            '+ application.yaml' \
+            '+ logback*.xml' \
+            '+ logging*.xml' \
+            '+ context*.xml' \
+            '+ web.xml' \
+            '+ robots.txt' \
+            '+ sitemap.xml' \
+            '+ favicon.ico' \
+            '+ .well-known/***' \
+            '+ /META-INF/resources/***' \
+            '- *' \
+            | sudo tee "$RSYNC_FILTER" >/dev/null
+            ;;
+          *) :;;
+        esac
+      }
+
+      #######################################################################
+      # resolve_base_commit_from_live
+      # 목적:
+      #   - BASE_COMMIT 미설정 시, 현재 LIVE 심링크가 가리키는 릴리스 디렉터리의
+      #     _logs/commit.log 에서 COMMIT 값을 직접 읽어 BASE_COMMIT으로 설정 
+      # 동작:
+      #   1) LIVE 경로(심링크 또는 디렉터리) → 실경로 계산
+      #   2) _logs/commit.log 존재 시 COMMIT= 값 추출
+      #   3) 성공 시 BASE_COMMIT 업데이트
+      #######################################################################
+      resolve_base_commit_from_live() {
+        if [ -z "${BASE_COMMIT:-}" ]; then
+          # 앱 이름/라이브 경로 계산
+          local app_name live_link real_path prev_commit=""
+          app_name="${CONTEXT_PATH#/}"                    # "/devops" → "devops"
+          live_link="${WEBAPPS_ROOT%/}/${app_name}"
+          
+          log "LIVE 기준 BASE_COMMIT 획득 시도: ${live_link}"
+          
+          # LIVE가 심링크이면 readlink -f 로 실경로 추적
+          if sudo test -L "$live_link"; then
+            real_path="$(sudo readlink -f "$live_link" 2>/dev/null || true)"
+          elif sudo test -d "$live_link"; then
+            real_path="$live_link"
+          else
+            real_path=""
+          fi
+          
+          # commit.log 읽기 시도
+          if [ -n "$real_path" ] && sudo test -f "$real_path/_logs/commit.log"; then
+            prev_commit="$(sudo awk -F= '/^COMMIT=/{print $2}' "$real_path/_logs/commit.log" | tr -d '\r')"
+          fi
+          
+          if [ -n "$prev_commit" ]; then
+            BASE_COMMIT="$prev_commit"
+            log "BASE_COMMIT(from LIVE commit.log): $BASE_COMMIT"
+          else
+            log "LIVE commit.log 없음 → git-diff 예측은 생략"
+          fi
+           fi
+      }
+
+      compute_preview_diff() {
+        RSYNC_RAW_OUT="$ART_DIR/rsync.out"
+        RSYNC_PATHS="$ART_DIR/rsync.paths"
+        REPORT_TXT="$ART_DIR/report.txt"
+        # [FIX] rsync 필터 파일 경로(함수 공통 사용)
+        RSYNC_FILTER="$ART_DIR/rsync.filter"
+        
+        # 예측 리스트 복원
+        if [ -n "${PREDICTED_LIST_B64:-}" ]; then
+          echo "$PREDICTED_LIST_B64" | base64 -d > "$ART_DIR/predicted.list" || : 
+        else
+          : > "$ART_DIR/predicted.list"
+        fi
+
+        if [ -z "${BASE_DIR:-}" ] || ! sudo test -d "$BASE_DIR"; then
+          log "[ADD] PREVIEW: 유효한 BASE_DIR 없음 (첫 배포 등) → 프리뷰 생략"
+          printf "=== Diff Deploy Preview Report ===\n(no BASE_DIR → preview skipped)\n" | sudo tee "$REPORT_TXT" >/dev/null
+          return 0
+        fi
+
+        make_filter_if_enabled
+
+        common_excludes=(--exclude='_logs' --exclude='_logs/**' \
+                         --exclude='*.bad' --exclude='*.tmp' --exclude='*.bak' \
+                         --exclude='*.swp' --exclude='*.log')
+
+        if sudo test -f "$ART_DIR/rsync.filter"; then
+          sudo rsync -rlpgoDic --delete --dry-run --out-format='%i %n' \
+            --filter="merge $ART_DIR/rsync.filter" \
+            "${common_excludes[@]}" \
+            "${new_dir%/}/" "${BASE_DIR%/}/" | tee "$RSYNC_RAW_OUT" >/dev/null
+        else
+          sudo rsync -rlpgoDic --delete --dry-run --out-format='%i %n' \
+            "${common_excludes[@]}" \
+            "${new_dir%/}/" "${BASE_DIR%/}/" | tee "$RSYNC_RAW_OUT" >/dev/null
+        fi
+
+        awk '{sub(/^[^ ]+[ ]+/,""); print}' "$RSYNC_RAW_OUT" \
+          | sed -e 's#^\.\/##' -e '/\/$/d' \
+          | sort -u > "$RSYNC_PATHS" || true
+
+        # 교차 비교
+        if [ -s "$ART_DIR/predicted.list" ]; then
+          sort -u "$ART_DIR/predicted.list" -o "$ART_DIR/predicted.list"
+          comm -12 "$ART_DIR/predicted.list" "$RSYNC_PATHS" > "$ART_DIR/intersection.txt" || true
+          comm -23 "$ART_DIR/predicted.list" "$RSYNC_PATHS" > "$ART_DIR/missing.from.rsync.txt" || true
+          comm -13 "$ART_DIR/predicted.list" "$RSYNC_PATHS" > "$ART_DIR/extra.in.rsync.txt" || true
+        else
+          : > "$ART_DIR/intersection.txt"
+          : > "$ART_DIR/missing.from.rsync.txt"
+          : > "$ART_DIR/extra.in.rsync.txt"
+        fi
+
+        {
+          echo "=== Diff Deploy Preview Report ==="
+          echo "Version   : $NEW_VERSION"
+          echo "Context   : $APP_NAME"
+          echo "Base Dir  : $BASE_DIR"
+          echo "New Dir   : $new_dir"
+          echo "Filter    : ${SAFE_FILTER_MODE:-static}"
+          echo
+          echo "[GIT DIFF 예상 변경 개수]"
+          (wc -l < "$ART_DIR/predicted.list") 2>/dev/null || echo 0
+          head -30 "$ART_DIR/predicted.list" 2>/dev/null || true
+          echo
+          echo "[rsync --dry-run 파일 변경 개수]"
+          (wc -l < "$RSYNC_PATHS") 2>/dev/null || echo 0
+          head -30 "$RSYNC_PATHS" 2>/dev/null || true
+          echo
+          echo "[교집합] git 예상 ∩ rsync"
+          head -30 "$ART_DIR/intersection.txt" 2>/dev/null || true
+          echo
+          echo "[MISSING] git 변경에는 있지만 rsync 없음"
+          head -30 "$ART_DIR/missing.from.rsync.txt" 2>/dev/null || true
+          echo
+          echo "[EXTRA] rsync에는 있지만 예상에 없음"
+          head -30 "$ART_DIR/extra.in.rsync.txt" 2>/dev/null || true
+        } | sudo tee "$REPORT_TXT" >/dev/null
+
+        log "[ADD] 프리뷰 리포트 생성: $REPORT_TXT"
       }
 
       # ── 헬스체크 후 실패 시 롤백 ─────────────────────────
@@ -2583,15 +4881,110 @@
 
       # ── 산출물 ZIP ─────────────────────────────────────
       package_artifacts() {
-        # .env 생성
         sudo sh -c "printf 'NEW_VERSION=%s\nNEW_DIR=%s\nPREV_DIR=%s\nLIVE_LINK=%s\n' \
           \"$NEW_VERSION\" \"$new_dir\" \"${prev_target:-}\" \"$LIVE_LINK\" > \"$ART_DIR/.env\""
 
-        # zip 생성
-        sudo sh -c "(cd \"$ART_DIR\" && zip -r \"$(basename "$OUT_ZIP")\" \"$(basename "$LOG")\" .env >/dev/null 2>&1) || true"
+        # [ADD] 프리뷰 산출물도 함께 ZIP에 포함
+        sudo sh -c "(cd \"$ART_DIR\" && zip -r \"$(basename "$OUT_ZIP")\" \
+          \"$(basename "$LOG")\" \
+          .env \
+          rsync.out rsync.paths report.txt rsync.filter \
+          predicted.list intersection.txt missing.from.rsync.txt extra.in.rsync.txt \
+          >/dev/null 2>&1) || true"
 
         ok "Artifacts packaged: $OUT_ZIP"
         echo "$OUT_ZIP"
+      }
+
+      # ───────────────────────────────────────────────
+      # [ADD] copy_preview_logs_to_release()
+      # 목적:
+      #   - 프리뷰 리포트(rsync.out, report.txt 등)를
+      #     새 릴리스 디렉터리의 _logs 로 복사
+      # ───────────────────────────────────────────────
+      copy_preview_logs_to_release() {
+        local src_dir="$ART_DIR"
+        local dst_logs="$new_dir/_logs"
+
+        sudo mkdir -p "$dst_logs"
+
+        local files=(
+          rsync.out
+          rsync.paths
+          report.txt
+          rsync.filter
+          predicted.list
+          intersection.txt
+          missing.from.rsync.txt
+          extra.in.rsync.txt
+        )
+
+        for f in "${files[@]}"; do
+          if sudo test -f "$src_dir/$f"; then
+            sudo cp -f "$src_dir/$f" "$dst_logs/" || true
+          fi
+        done
+
+        log "[ADD] 프리뷰 로그를 ${dst_logs} 에 복사 완료"
+      }
+      
+      # ───────────────────────────────────────────────
+      # [NEW] 함수: write_pre_deploy_commit_log_if_missing
+      # 목적:
+      #   - BASE_COMMIT 값이 있을 경우,
+      #     LIVE 디렉터리에 commit.log가 없으면 자동으로 생성
+      #   - 기존 commit.log가 있거나 BASE_COMMIT이 비어 있으면 아무 작업 안 함
+      # ───────────────────────────────────────────────
+      write_pre_deploy_commit_log_if_missing() {
+        # BASE_COMMIT이 없으면 스킵
+        if [ -z "${BASE_COMMIT:-}" ]; then
+          log "[PRE-DEPLOY] BASE_COMMIT 미설정 → commit.log 기록 생략"
+          return 0
+        fi
+      
+        # LIVE 실경로 추적 (심링크 or 디렉터리)
+        local live_real=""
+        if sudo test -L "$LIVE_LINK"; then
+          live_real="$(sudo readlink -f "$LIVE_LINK" 2>/dev/null || true)"
+        elif sudo test -d "$LIVE_LINK"; then
+          live_real="$LIVE_LINK"
+        fi
+      
+        # 유효한 LIVE가 없으면 스킵
+        if [ -z "$live_real" ] || ! sudo test -d "$live_real"; then
+          log "[PRE-DEPLOY] LIVE 디렉터리 없음 → commit.log 기록 생략"
+          return 0
+        fi
+      
+        # 이미 commit.log가 존재하면 스킵
+        local logf="$live_real/_logs/commit.log"
+        if sudo test -f "$logf"; then
+          log "[PRE-DEPLOY] 기존 commit.log 존재 → skip ($logf)"
+          return 0
+        fi
+      
+        # 생성
+        sudo mkdir -p "$live_real/_logs"
+        sudo sh -c "printf 'COMMIT=%s\nDATE=%s\nNOTE=base_commit_predeploy\n' \
+          \"$BASE_COMMIT\" \"\$(date -Iseconds)\" > '$logf'"
+        log "[PRE-DEPLOY] commit.log 생성 완료: $logf (COMMIT=$BASE_COMMIT)"
+      }
+
+      # ───────────────────────────────────────────────
+      # [NEW] 배포 성공 후 releases/_logs/commit.log 기록
+      #   - 파일 내용 형식:
+      #       COMMIT=<sha>
+      #       TAG=<vX.Y.Z>
+      #       VERSION=<X.Y.Z>
+      #       DATE=<ISO-8601>
+      # ───────────────────────────────────────────────
+      write_commit_log() {
+        # 릴리스 디렉터리 내부 로그 경로
+        ensure_logs_dir "$new_dir"
+        local file="$new_dir/_logs/commit.log"
+        sudo sh -c "printf 'COMMIT=%s\nTAG=%s\nVERSION=%s\nDATE=%s\n' \
+          \"$CURRENT_COMMIT_SHA\" \"$COMMIT_TAG\" \"$NEW_VERSION\" \"\$(date -Iseconds)\" > \"$file\""
+        log "Wrote commit info to ${file}" 
       }
 
       # ── 메인 ───────────────────────────────────────────
@@ -2599,24 +4992,41 @@
         require_env
         ensure_tools
 
-        prepare_new_version           # 새 릴리스 디렉터리 생성
-        migrate_live_once             # 기존 LIVE 이관/탐지 (최초 배포면 prev_target 없음)
-        set_live_symlink "$new_dir"   # LIVE → 새 버전 전환
+        prepare_new_version                     # 새 릴리스 디렉터리 생성
+        migrate_live_once                       # 기존 LIVE 이관/탐지 (최초 배포면 prev_target 없을 수 있음)
+        write_pre_deploy_commit_log_if_missing  # [NEW] LIVE 교체 전 commit.log 보강 (BASE_COMMIT 있을 경우)
+  
+        # [ADD] PREVIEW: 현재 LIVE(또는 prev_target)와 NEW 간 rsync dry-run 리포트 생성
+        resolve_base_for_preview
+        compute_preview_diff
+        copy_preview_logs_to_release
+
+        resolve_base_commit_from_live    # LIVE → BASE_COMMIT 정보 추출
+        set_live_symlink "$new_dir"      # LIVE → 새 버전 전환
         tomcat_reload_or_restart
 
         hc_url="$(health_url_build)"
         healthcheck_or_rollback "$hc_url" "$new_dir" "${prev_target:-}"  # 실패 시 내부에서 롤백/종료
 
-        # 헬스 성공 시: 두 번째 배포부터 live-pointer 기록 (조건은 함수 내부에 포함)
-        write_live_pointer "$new_dir" "${prev_target:-}"
+        write_live_pointer "$new_dir" "${prev_target:-}"  # 헬스 성공 시 포인터 기록
+        write_commit_log "$new_dir"                       # [NEW] 성공 시 커밋 기록
 
         prune_releases
-        package_artifacts             # 마지막 줄에 ZIP 경로 echo
+        package_artifacts                # 마지막 줄에 ZIP 경로 echo
       }
 
       main "$@"
 
     REMOTE_SH
+
+      # ── 현재 커밋 SHA 계산(원격 commit.log에 기록용) ─────────────
+      if [ -n "${CI_COMMIT_SHA:-}" ]; then
+        CURRENT_COMMIT_SHA="$CI_COMMIT_SHA"
+      elif command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        CURRENT_COMMIT_SHA="$(git rev-parse --verify HEAD 2>/dev/null || echo "")"
+      else
+        CURRENT_COMMIT_SHA=""
+      fi
 
       # ── 원격 실행 ─────────────────────────────────────
       log "▶ Executing symlink deploy via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
@@ -2644,7 +5054,13 @@
         "DEPLOY_LOG_NAME='$(shq "$deploy_log_name")'" \
         "MARK_BAD_ON_ROLLBACK='$(shq "${MARK_BAD_ON_ROLLBACK:-true}")'" \
         "BAD_MARKER_NAME='$(shq "${BAD_MARKER_NAME:-.bad}")'" \
-        'export REMOTE_DIR RELEASE_REPO_URL GROUP_ID ARTIFACT_ID COMMIT_TAG WAS_URL NEXUS_USER NEXUS_PASS CONTEXT_PATH WEBAPPS_ROOT RELEASES_BASE TOMCAT_SERVICE KEEP_RELEASES HEALTH_MODE HEALTH_URL_OVERRIDE HC_TIMEOUT HC_INTERVAL HOT_RELOAD DEPLOY_USER DEPLOY_PASS DEPLOY_LOG_NAME MARK_BAD_ON_ROLLBACK BAD_MARKER_NAME; bash -s' \
+        "SAFE_FILTER_MODE='$(shq "$SAFE_FILTER_MODE")'" \
+        "PREDICTED_LIST_B64='$(shq "${PREDICTED_LIST_B64:-}")'" \
+        "CURRENT_COMMIT_SHA='$(shq "${CURRENT_COMMIT_SHA:-}")'" \
+        "BASE_COMMIT='$(shq "${BASE_COMMIT:-}")'" \
+        "ARTIFACT_USER='$(shq "${ARTIFACT_USER:-}")'" \
+        "ARTIFACT_GROUP='$(shq "${ARTIFACT_GROUP:-}")'" \
+        'export REMOTE_DIR RELEASE_REPO_URL GROUP_ID ARTIFACT_ID COMMIT_TAG WAS_URL NEXUS_USER NEXUS_PASS CONTEXT_PATH WEBAPPS_ROOT RELEASES_BASE TOMCAT_SERVICE KEEP_RELEASES HEALTH_MODE HEALTH_URL_OVERRIDE HC_TIMEOUT HC_INTERVAL HOT_RELOAD DEPLOY_USER DEPLOY_PASS DEPLOY_LOG_NAME MARK_BAD_ON_ROLLBACK BAD_MARKER_NAME SAFE_FILTER_MODE PREDICTED_LIST_B64 CURRENT_COMMIT_SHA BASE_COMMIT ARTIFACT_USER ARTIFACT_GROUP; bash -s' \
         < "$remote_script" | tee /tmp/_symlink_deploy_out.txt
 
       # 산출물 회수
@@ -2658,7 +5074,418 @@
       ok "Symlink deploy finished"
     }
 
- 
+.fn_tomcat_deploy_preview:
+  script: |
+    fn_tomcat_deploy_preview() {
+      set -eu
+
+      # ── 필수 입력 ─────────────────────────────────────
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${GROUP_ID:?GROUP_ID is required}"
+      : "${ARTIFACT_ID:?ARTIFACT_ID is required}"
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${CONTEXT_PATH:?CONTEXT_PATH is required}"   # 예: /devops
+
+      # ── 선택 입력(기본값) ───────────────────────────
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      webapps_root="${TOMCAT_WEBAPPS_DIR:-/opt/tomcat/webapps}"
+      releases_base="${RELEASES_BASE:-/opt/tomcat/releases}"
+
+      # 프리뷰 필터/예측
+      SAFE_FILTER_MODE="${SAFE_FILTER_MODE:-static}"   # static|dynamic|none
+      BASE_COMMIT="${BASE_COMMIT:-}"                   # git diff base(optional)
+
+      # 로그/산출물
+      preview_log_name="${PREVIEW_LOG_NAME:-symlink-preview.log}"
+
+      # ── 로컬 유틸 ─────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      # ── BASE_COMMIT 보강(원격 LIVE의 commit.log에서 추출 시도) ──
+      fetch_base_commit_from_remote_live() {
+        : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+        : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+        : "${CONTEXT_PATH:?CONTEXT_PATH is required}"
+
+        if [ -n "${BASE_COMMIT:-}" ]; then
+          log "[INFO] BASE_COMMIT 설정됨 → live 에서 읽기 생략"
+          return 0
+        fi
+
+        local remote_port="${REMOTE_DEPLOY_PORT:-22}"
+        local webapps_root="${TOMCAT_WEBAPPS_DIR:-/opt/tomcat/webapps}"
+        local app_name="${CONTEXT_PATH#/}"
+        local live_link="${webapps_root%/}/${app_name}"
+        local prev_commit=""
+
+        log "[SSH] 원격 LIVE commit.log 조회 중: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+
+        prev_commit="$(
+          ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+            "LIVE='$live_link';
+             if sudo test -L \"\$LIVE\"; then REAL=\$(sudo readlink -f \"\$LIVE\" 2>/dev/null || true);
+             elif sudo test -d \"\$LIVE\"; then REAL=\"\$LIVE\"; 
+             else REAL=\"\"; fi;
+             if [ -n \"\$REAL\" ] && sudo test -f \"\$REAL/_logs/commit.log\"; then
+               sudo awk -F= '/^COMMIT=/{print \$2}' \"\$REAL/_logs/commit.log\" | tr -d '\r';
+             fi" 2>/dev/null || true
+        )"
+
+        if [ -n "$prev_commit" ]; then
+          export BASE_COMMIT="$prev_commit"
+          log "[OK] BASE_COMMIT(from remote LIVE): $BASE_COMMIT"
+        else
+          log "[WARN] 원격 LIVE commit.log 없음 → BASE_COMMIT 미설정"
+        fi
+      }
+
+      # ── 로컬 git diff → predicted.list(base64) ─────────
+      build_predicted_list_b64() {
+        PREDICTED_LIST_B64=""
+
+        if ! command -v git >/dev/null 2>&1; then
+          log "[ADD] git 없음 → 예측 목록 생략"
+          return 0
+        fi
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          log "[ADD] .git 미존재 → 예측 목록 생략"
+          return 0
+        fi
+
+        # [NEW] HEAD/CURRENT_COMMIT
+        local head_ref
+        if [ -n "${CI_COMMIT_SHA:-}" ]; then
+          head_ref="$CI_COMMIT_SHA"
+        else
+          head_ref="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+        fi
+        if [ -z "$head_ref" ]; then
+          log "[ADD] HEAD 찾기 실패 → 예측 목록 생략"
+          return 0
+        fi
+
+        # [NEW] BASE_COMMIT이 최종적으로 없으면 예측 스킵
+        local base_ref=""
+        if [ -n "${BASE_COMMIT:-}" ]; then
+          base_ref="$BASE_COMMIT"
+        else
+          log "[ADD] BASE_COMMIT 미설정 → 예측 목록 생략"
+          return 0
+        fi
+        if ! git cat-file -e "$base_ref^{commit}" 2>/dev/null; then
+          log "[ADD] BASE_COMMIT($base_ref) 유효하지 않음 → 예측 목록 생략"
+          return 0
+        fi
+
+        local tmpd base rel
+        tmpd="$(mktemp -d)"
+        # shellcheck disable=SC2064
+        trap "rm -rf '$tmpd'" EXIT
+
+        git diff --name-status "$base_ref" "$head_ref" > "$tmpd/changed.tab" || true
+        : > "$tmpd/predicted.list"
+
+        while IFS=$'\t' read -r _status path || [ -n "${path:-}" ]; do
+          case "$path" in
+            src/main/java/*)
+              base="${path#src/main/java/}"
+              base="${base%.java}"
+              printf 'WEB-INF/classes/%s.class\n' "$base" >> "$tmpd/predicted.list"
+              ;;
+            src/main/resources/*)
+              rel="${path#src/main/resources/}"
+              printf 'WEB-INF/classes/%s\n' "$rel" >> "$tmpd/predicted.list"
+              ;;
+            src/main/webapp/*)
+              printf '%s\n' "${path#src/main/webapp/}" >> "$tmpd/predicted.list"
+              ;;
+            *) :;;
+          esac
+        done < "$tmpd/changed.tab"
+
+        sort -u "$tmpd/predicted.list" -o "$tmpd/predicted.list"
+
+        if command -v base64 >/dev/null 2>&1; then
+          if base64 --help 2>&1 | grep -q -- '-w'; then
+            PREDICTED_LIST_B64="$(base64 -w0 "$tmpd/predicted.list" || true)"
+          else
+            PREDICTED_LIST_B64="$(base64 < "$tmpd/predicted.list" | tr -d '\n' || true)"
+          fi
+        fi
+      }
+
+      fetch_base_commit_from_remote_live
+      build_predicted_list_b64
+
+      # ── 원격 스크립트 작성/실행 ─────────────────────────
+      remote_script=$(mktemp /tmp/remote_symlink_preview.XXXXXX)
+      log "Created temporary symlink preview script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      #!/usr/bin/env bash
+      set -euo pipefail
+      IFS=$'\n\t'
+
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      need() { command -v "$1" >/dev/null 2>&1; }
+      ts()   { date +%Y%m%d%H%M%S; }
+
+      # ENV
+      : "${REMOTE_DIR:?}"; : "${RELEASE_REPO_URL:?}"; : "${GROUP_ID:?}"; : "${ARTIFACT_ID:?}"
+      : "${COMMIT_TAG:?}"; : "${CONTEXT_PATH:?}"; : "${WEBAPPS_ROOT:?}"; : "${RELEASES_BASE:?}"
+
+      : "${SAFE_FILTER_MODE:=static}"
+      : "${PREDICTED_LIST_B64:=}"
+
+      APP_NAME="${CONTEXT_PATH#/}"
+      LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
+      APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
+
+      ART_DIR="$REMOTE_DIR/artifacts"
+      LOG="$ART_DIR/symlink-preview.log"
+      OUT_ZIP="$ART_DIR/symlink-preview-artifacts.zip"
+
+      NEW_VERSION="${COMMIT_TAG#v}"
+      BASE_URL="${RELEASE_REPO_URL%/}/${GROUP_ID//.//}/${ARTIFACT_ID}"
+      NEW_WAR="${ARTIFACT_ID}-${NEW_VERSION}.war"
+      NEW_URL="${BASE_URL}/${NEW_VERSION}/${NEW_WAR}"
+
+      PREVIEW_NEW_DIR="$REMOTE_DIR/preview/${APP_NAME}/${NEW_VERSION}"   # ← releases에 손대지 않음
+
+      sudo mkdir -p "$ART_DIR" "$(dirname "$PREVIEW_NEW_DIR")"
+      sudo sh -c ": > \"$LOG\""
+
+      # 도구
+      ensure_tools() {
+        local pkgs=(curl unzip rsync awk sed sort uniq tee base64)
+        for t in "${pkgs[@]}"; do
+          need "$t" || {
+            if   need apk; then sudo apk add --no-cache "$t" || true
+            elif need apt-get; then sudo apt-get update -y || true; sudo apt-get install -y "$t" || true
+            elif need dnf; then sudo dnf install -y "$t" || true
+            elif need yum; then sudo yum install -y "$t" || true
+            elif need zypper; then sudo zypper -n install "$t" || true
+            fi
+          }
+        done
+        for t in "${pkgs[@]}"; do need "$t" || fail "'$t' not available"; done
+      }
+
+      # NEW(미리보기 전용) 준비: REMOTE_DIR/preview/... 에만 전개
+      prepare_preview_new() {
+        local tmp="$PREVIEW_NEW_DIR.tmp.$$"
+        sudo rm -rf "$PREVIEW_NEW_DIR" "$tmp"
+        sudo mkdir -p "$tmp"
+        log "Download NEW (preview only): $NEW_URL"
+        sudo curl -fsS -o "$tmp/$NEW_WAR" "$NEW_URL"
+        sudo unzip -q "$tmp/$NEW_WAR" -d "$tmp/unzip"
+        sudo test -d "$tmp/unzip/WEB-INF" || fail "WAR invalid (no WEB-INF)"
+        sudo mv "$tmp/unzip" "$PREVIEW_NEW_DIR"
+        sudo rm -rf "$tmp"
+        printf 'NEW_DIR(PREVIEW)=%s\n' "$PREVIEW_NEW_DIR" | sudo tee -a "$LOG" >/dev/null
+      }
+
+      # BASE_DIR 결정: LIVE만 참조(심링크 실경로 또는 디렉터리)
+      resolve_base_from_live() {
+        BASE_DIR=""
+        if sudo test -L "$LIVE_LINK"; then
+          BASE_DIR="$(sudo readlink -f "$LIVE_LINK" 2>/dev/null || true)"
+        elif sudo test -d "$LIVE_LINK"; then
+          BASE_DIR="$LIVE_LINK"
+        fi
+        if [ -z "$BASE_DIR" ] || ! sudo test -d "$BASE_DIR"; then
+          log "No valid BASE_DIR (first deploy scenario?) → preview will be marked as skipped."
+        else
+          printf 'BASE_DIR=%s\n' "$BASE_DIR" | sudo tee -a "$LOG" >/dev/null
+        fi
+      }
+
+      # 필터
+      make_filter_if_enabled() {
+        RSYNC_FILTER="$ART_DIR/rsync.filter"
+        case "$SAFE_FILTER_MODE" in
+          none|"") : > "$RSYNC_FILTER"; return 0 ;;
+          static)
+            sudo printf '%s\n' \
+              '+ /WEB-INF/classes/***' '+ /WEB-INF/lib/***' \
+              '+ *.jsp' '+ *.jspf' '+ *.jspx' '+ *.tag' '+ *.tagx' '+ *.tld' \
+              '+ /WEB-INF/**/*.jsp' '+ /WEB-INF/**/*.jspf' '+ /WEB-INF/**/*.jspx' '+ /WEB-INF/**/*.tag' '+ /WEB-INF/**/*.tagx' '+ /WEB-INF/**/*.tld' \
+              '+ *.html' '+ *.htm' '+ *.css' '+ *.js' \
+              '+ *.png' '+ *.jpg' '+ *.jpeg' '+ *.gif' '+ *.svg' '+ *.webp' 'favicon.ico' \
+              '+ *.xml' '+ *.properties' '+ *.yml' '+ *.yaml' 'MANIFEST.MF' \
+              '+ /META-INF/resources/***' \
+              '- *' \
+              | sudo tee "$RSYNC_FILTER" >/dev/null
+            ;;
+          dynamic)
+            sudo printf '%s\n' \
+              '+ /WEB-INF/classes/***' '+ /WEB-INF/lib/***' '+ /META-INF/***' '+ /BOOT-INF/***' \
+              '+ /static/***' '+ /public/***' '+ /assets/***' '+ /resources/***' \
+              '+ *.css' '+ *.js' '+ *.mjs' '+ *.map' '+ *.json' \
+              '+ *.html' '+ *.htm' '+ *.png' '+ *.jpg' '+ *.jpeg' '+ *.gif' '+ *.svg' '+ *.webp' \
+              '+ *.jsp' '+ *.jspf' '+ *.jspx' '+ *.tag' '+ *.tagx' '+ *.tld' '+ *.xhtml' \
+              '+ /WEB-INF/**/*.jsp' '+ /WEB-INF/**/*.jspf' '+ /WEB-INF/**/*.jspx' '+ /WEB-INF/**/*.tag' '+ /WEB-INF/**/*.tagx' '+ /WEB-INF/**/*.tld' '+ /WEB-INF/**/*.xhtml' \
+              '+ *.xml' '+ *.properties' '+ *.yml' '+ *.yaml' '+ *.ini' '+ *.conf' '+ *.cfg' '+ *.env' \
+              '+ *.txt' '+ *.csv' '+ *.tsv' '+ *.json5' '+ *.ftl' '+ *.vm' '+ *.mustache' '+ *.hbs' \
+              '+ /templates/***' '+ /views/***' 'MANIFEST.MF' \
+              'application.properties' 'application.yml' 'application.yaml' \
+              'logback*.xml' 'logging*.xml' 'context*.xml' 'web.xml' 'robots.txt' 'sitemap.xml' 'favicon.ico' \
+              '+ .well-known/***' '+ /META-INF/resources/***' \
+              '- *' \
+              | sudo tee "$RSYNC_FILTER" >/dev/null
+            ;;
+        esac
+      }
+
+      # 예측 리스트 복원
+      restore_predicted_list() {
+        if [ -n "${PREDICTED_LIST_B64:-}" ]; then
+          echo "$PREDICTED_LIST_B64" | base64 -d > "$ART_DIR/predicted.list" || :
+        else
+          : > "$ART_DIR/predicted.list"
+        fi
+      }
+
+      # 프리뷰 계산 (절대 실제 반영 없음)
+      compute_preview() {
+        RSYNC_RAW_OUT="$ART_DIR/rsync.out"
+        RSYNC_PATHS="$ART_DIR/rsync.paths"
+        REPORT_TXT="$ART_DIR/report.txt"
+
+        if [ -z "${BASE_DIR:-}" ] || ! sudo test -d "$BASE_DIR"; then
+          printf "=== Diff Deploy Preview Report ===\n(no BASE_DIR → preview skipped)\n" | sudo tee "$REPORT_TXT" >/dev/null
+          return 0
+        fi
+
+        make_filter_if_enabled
+        restore_predicted_list
+
+        common_excludes=(--exclude='_logs' --exclude='_logs/**' --exclude='*.bad' --exclude='*.tmp' --exclude='*.bak' --exclude='*.swp' --exclude='*.log')
+
+        sudo rsync -rlDic --delete --dry-run --out-format='%i %n' \
+          --filter="merge $ART_DIR/rsync.filter" \
+          "${common_excludes[@]}" \
+          "${PREVIEW_NEW_DIR%/}/" "${BASE_DIR%/}/" | tee "$RSYNC_RAW_OUT" >/dev/null
+
+        awk '{sub(/^[^ ]+[ ]+/,""); print}' "$RSYNC_RAW_OUT" \
+        | sed -e 's#^\.\/##' -e '/\/$/d' \
+        | sort -u > "$RSYNC_PATHS" || true
+
+        if [ -s "$ART_DIR/predicted.list" ]; then
+          sort -u "$ART_DIR/predicted.list" -o "$ART_DIR/predicted.list"
+          comm -12 "$ART_DIR/predicted.list" "$RSYNC_PATHS" > "$ART_DIR/intersection.txt" || true
+          comm -23 "$ART_DIR/predicted.list" "$RSYNC_PATHS" > "$ART_DIR/missing.from.rsync.txt" || true
+          comm -13 "$ART_DIR/predicted.list" "$RSYNC_PATHS" > "$ART_DIR/extra.in.rsync.txt" || true
+        else
+          : > "$ART_DIR/intersection.txt"; : > "$ART_DIR/missing.from.rsync.txt"; : > "$ART_DIR/extra.in.rsync.txt"
+        fi
+
+        {
+          echo "=== Diff Deploy Preview Report ==="
+          echo "Version   : $NEW_VERSION"
+          echo "Context   : $APP_NAME"
+          echo "Base Dir  : $BASE_DIR"
+          echo "New Dir   : $PREVIEW_NEW_DIR"
+          echo "Filter    : ${SAFE_FILTER_MODE:-static}"
+          echo
+          echo "[GIT DIFF 예상 변경 개수]"
+          (wc -l < "$ART_DIR/predicted.list") 2>/dev/null || echo 0
+          head -30 "$ART_DIR/predicted.list" 2>/dev/null || true
+          echo
+          echo "[rsync --dry-run 파일 변경 개수]"
+          (wc -l < "$RSYNC_PATHS") 2>/dev/null || echo 0
+          head -30 "$RSYNC_PATHS" 2>/dev/null || true
+          echo
+          echo "[교집합] git 예상 ∩ rsync"
+          head -30 "$ART_DIR/intersection.txt" 2>/dev/null || true
+          echo
+          echo "[MISSING] git 변경에는 있지만 rsync 없음"
+          head -30 "$ART_DIR/missing.from.rsync.txt" 2>/dev/null || true
+          echo
+          echo "[EXTRA] rsync에는 있지만 예상에 없음"
+          head -30 "$ART_DIR/extra.in.rsync.txt" 2>/dev/null || true
+        } | sudo tee "$REPORT_TXT" >/dev/null
+
+        log "Preview report generated: $REPORT_TXT"
+      }
+
+      package_artifacts() {
+        sudo sh -c "printf 'NEW_VERSION=%s\nPREVIEW_NEW_DIR=%s\nLIVE_BASE_DIR=%s\nLIVE_LINK=%s\n' \
+          \"$NEW_VERSION\" \"$PREVIEW_NEW_DIR\" \"${BASE_DIR:-}\" \"$LIVE_LINK\" > \"$ART_DIR/.env\""
+
+        sudo sh -c "(cd \"$ART_DIR\" && zip -r \"$(basename "$OUT_ZIP")\" \
+          \"$(basename "$LOG")\" \
+          .env \
+          rsync.out rsync.paths report.txt rsync.filter \
+          predicted.list intersection.txt missing.from.rsync.txt extra.in.rsync.txt \
+          >/dev/null 2>&1) || true"
+
+        ok "Artifacts packaged: $OUT_ZIP"
+        echo "$OUT_ZIP"
+      }
+
+      main() {
+        ensure_tools
+        prepare_preview_new          # REMOTE_DIR/preview/... 만 사용
+        resolve_base_from_live       # LIVE 기준 BASE_DIR, 없으면 preview skipped
+        compute_preview              # dry-run only
+        package_artifacts            # zip 경로 echo
+        ok "Symlink preview completed (no deployment performed)"
+      }
+
+      main
+    REMOTE_SH
+
+      # ── 원격 실행 ─────────────────────────────────────
+      log "▶ Executing symlink preview via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "RELEASE_REPO_URL='$(shq "$RELEASE_REPO_URL")'" \
+        "GROUP_ID='$(shq "$GROUP_ID")'" \
+        "ARTIFACT_ID='$(shq "$ARTIFACT_ID")'" \
+        "COMMIT_TAG='$(shq "$COMMIT_TAG")'" \
+        "CONTEXT_PATH='$(shq "$CONTEXT_PATH")'" \
+        "WEBAPPS_ROOT='$(shq "$webapps_root")'" \
+        "RELEASES_BASE='$(shq "$releases_base")'" \
+        "SAFE_FILTER_MODE='$(shq "$SAFE_FILTER_MODE")'" \
+        "PREDICTED_LIST_B64='$(shq "${PREDICTED_LIST_B64:-}")'" \
+        'export REMOTE_DIR RELEASE_REPO_URL GROUP_ID ARTIFACT_ID COMMIT_TAG CONTEXT_PATH WEBAPPS_ROOT RELEASES_BASE SAFE_FILTER_MODE PREDICTED_LIST_B64; bash -s' \
+        < "$remote_script" | tee /tmp/_symlink_preview_out.txt
+
+      # ── 산출물 회수 ─────────────────────────────────── 
+      remote_zip_path="$(
+        sed -n 's#^\(/.*symlink-preview-artifacts\.zip\)$#\1#p' /tmp/_symlink_preview_out.txt | tail -n1
+      )"
+
+      if [ -z "$remote_zip_path" ]; then
+        echo "[ERR] zip path not found in /tmp/_symlink_preview_out.txt"
+        echo "--- preview output ---"
+        cat /tmp/_symlink_preview_out.txt || true
+        exit 1
+      fi
+
+      local_dir="${CI_PROJECT_DIR:-.}/artifacts"
+      mkdir -p "$local_dir"
+      echo "[DEBUG] remote_zip_path=$remote_zip_path"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip_path" "$local_dir/"
+
+      local_zip="$local_dir/$(basename "$remote_zip_path")"
+      [ -s "$local_zip" ] || { echo "[ERR] not found: $local_zip"; ls -lAh "$local_dir"; exit 1; }
+
+
+      ok "Symlink preview finished: $local_zip"
+
+    }
+
+
 # ────────────────────────────────────────────────
 # 함수: fn_tomcat_symbolic_restore
 #
@@ -2667,59 +5494,6 @@
 #   - (선택) 헬스체크 수행. 실패 시 실패로 종료(필요 시 한 단계 더 이전으로 수동 롤백).
 #
 # 동작 개요:
-
-# GitLab Runner
-#    │
-#    ├─ SSH 접속
-#    │
-#    ▼
-# Tomcat Server
-#   (/opt/tomcat/webapps/<APP>, /opt/tomcat/releases/<APP>/)
-#    │
-#    ├─ (1) Nexus에서 NEW WAR 다운로드 (HTTPS, curl -u)
-#    │       BASE = <RELEASE_REPO_URL>/<GROUP_ID>/<ARTIFACT_ID>/
-#    │       NEW  = <ARTIFACT_ID>-<NEW_VERSION>.war
-#    │       TMP  = /opt/tomcat/releases/<APP>/<APP>-<ver>.tmp.$$
-#    │            → unzip →  TMP/unzip/
-#    │            → mv TMP/unzip  ⇒  /opt/tomcat/releases/<APP>/<APP>-<ver> (new_dir)
-#    │            → rm -rf TMP
-#    │
-#    ├─ (2) LIVE 링크 교정(최초 1회만)
-#    │       LIVE_LINK = /opt/tomcat/webapps/<APP>
-#    │       - LIVE가 디렉터리면:
-#    │           • 백업 디렉터리 생성: /opt/tomcat/releases/<APP>/<APP>-legacy-<ts>/
-#    │           • LIVE/* → legacy 로 이동 후 LIVE 제거
-#    │           • ln -s <new_dir>  LIVE_LINK
-#    │       - LIVE가 파일/깨진 링크면 제거 후 신규 심링크 생성
-#    │       - 이미 심링크면 통과
-#    │
-#    ├─ (3) LIVE 전환 (원자적 심링크 스위치)
-#    │       ln -sfn <new_dir>  <LIVE_LINK>
-#    │       (이전 대상은 readlink -f <LIVE_LINK>로 prev_target 확보)
-#    │
-#    ├─ (4) Tomcat 적용
-#    │       - HOT_RELOAD=true & manager 계정 있으면:
-#    │           http://<WAS_URL>/manager/text/reload?path=/<APP>
-#    │       - 아니면: systemctl reload 실패 시 restart
-#    │
-#    ├─ (5) 헬스체크 (선택)
-#    │       - HEALTH_URL_OVERRIDE 지정 시 해당 URL
-#    │       - 아니면 모드별:
-#    │           actuator: http://127.0.0.1:8080/<APP>/actuator/health
-#    │           page:     http://127.0.0.1:8080/<APP>/
-#    │           none:     스킵
-#    │       - 실패 시:
-#    │           ln -sfn <prev_target>  <LIVE_LINK>   # 즉시 롤백
-#    │           Tomcat reload/restart 후 종료(실패)
-#    │
-#    ├─ (6) 보관정책(KEEP_RELEASES)
-#    │       /opt/tomcat/releases/<APP>/<APP>-* 를 최신순 정렬
-#    │       → 최신 N개 남기고 나머지 삭제(이때 prev_target 은 삭제 제외)
-#    │
-#    └─ (7) 결과 산출물(zip)
-#            <REMOTE_DIR>/artifacts/symlink-deploy-artifacts.zip
-#              ├── symlink-deploy.log
-#              └── .env (CHANGED, NEW_DIR, PREV_DIR, LIVE_LINK)
 #
 # 특징:
 #   - diff(증분) 복원 방식이 아닌, “심링크 전환” 기반의 즉시 롤백

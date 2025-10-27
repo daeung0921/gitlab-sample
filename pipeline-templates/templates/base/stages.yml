@@ -3,6 +3,7 @@ stages:
   - test                 # 단위/통합 테스트 
   - security             # security 테스트 
   - package              # Artifact Nexus 배포
+  - staging              # 스테이징 서버 배포
   - deploy               # 운영 서버 배포
   - rollback             # 운영 서버 롤백 
   - notify               # 배포결과 티켓에 업데이트 

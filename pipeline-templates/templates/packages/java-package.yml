@@ -3,11 +3,11 @@
   script: 
     - !reference [.fn_mvn_deploy_snapshot, script] 
     - fn_mvn_deploy_snapshot
-    - unzip -o artifacts/deploy-snapshot-artifacts.zip -d deploy-snapshot-unpacked
+    - unzip -o artifacts/deploy-snapshot-artifacts.zip -d package-snapshot-unpacked
   artifacts:
-    name: "deploy-snapshot-$CI_COMMIT_REF_SLUG"
+    name: "package-snapshot-$CI_PIPELINE_ID"
     paths:
-      - deploy-snapshot-unpacked/
+      - package-snapshot-unpacked/
     expire_in: 1 day
 
 .package_release:
@@ -15,9 +15,9 @@
   script:
     - !reference [.fn_mvn_deploy_release, script]
     - fn_mvn_deploy_release
-    - unzip -o artifacts/deploy-release-artifacts.zip -d deploy-release-unpacked
+    - unzip -o artifacts/deploy-release-artifacts.zip -d package-release-unpacked
   artifacts:
-    name: "deploy-release-$CI_COMMIT_TAG"
+    name: "package-release-$CI_PIPELINE_ID"
     paths:
-      - deploy-release-unpacked/
+      - package-release-unpacked/
     expire_in: 1 day
