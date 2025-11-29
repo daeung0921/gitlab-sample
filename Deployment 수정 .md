@@ -74,12 +74,13 @@
             local path="$1"
             local user="$2"
             local group="$3"
-         
-            if [ -z "$path" ] || [ ! -e "$path" ]; then
-                log "ERROR: path does not exist: '$path'" >&2
+
+            # path 존재 여부 확인 (sudo 필요할 수도 있음)
+            if [ -z "$path" ] || ! sudo test -e "$path"; then
+                echo "ERROR: path does not exist: '$path'" >&2
                 return 1
             fi
-        
+
             # 위험한 경로는 금지
             case "$path" in
                 /|/etc|/usr|/bin|/sbin|/lib*|/var*)
@@ -87,15 +88,15 @@
                     return 1
                     ;;
             esac
-        
+
             # 소유권 변경
             sudo chown -R "$user:$group" "$path"
-        
+
             # 권한 변경 (파일/디렉터리 구분)
-            if [ -d "$path" ]; then
+            if sudo test -d "$path"; then
                 sudo find "$path" -type d -exec chmod 0755 {} +
                 sudo find "$path" -type f -exec chmod 0644 {} +
-            elif [ -f "$path" ]; then
+            elif sudo test -f "$path"; then
                 sudo chmod 0644 "$path"
             else
                 echo "WARNING: '$path' is neither file nor directory" >&2
