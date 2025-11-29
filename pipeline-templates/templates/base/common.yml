@@ -17,7 +17,7 @@ variables:
   REMOTE_DEPLOY_HOST: ""                         # 운영 Tomcat 서버
   REMOTE_DEPLOY_USER: ""                         # SSH 사용자
   REMOTE_DEPLOY_PORT: "22"                       # SSH 포트
-  REMOTE_DIR: "/tmp/gitlab-build-$CI_PIPELINE_ID" # 원격 작업/아티팩트 디렉터리
+  REMOTE_DIR: "/gitlab_ci_jobs/gitlab-ci-${CI_PIPELINE_ID}-${CI_JOB_ID}"  
   REMOTE_SETTINGS: "/opt/apache-maven/conf/settings.xml" # 원격 Maven settings.xml 경로
 
   # ─── Nexus / Artifact ─────────────────────────────────────────────────────

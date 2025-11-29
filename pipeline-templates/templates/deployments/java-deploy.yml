@@ -40,6 +40,7 @@
       - deploy-release-war-unpacked/
     expire_in: 1 day
 
+
 # ────────────────────────────────────────────────
 # 운영 Diff 배포
 # ────────────────────────────────────────────────
@@ -54,6 +55,9 @@
     name: production
     url: "http://$WAS_URL$CONTEXT_PATH/"
   script:
+    - !reference [.fn_tomcat_diff_remote_hook_custom, script]
+    - !reference [.fn_tomcat_diff_remote_hook_slack, script]
+    - !reference [.fn_tomcat_diff_remote_hook_dispatcher, script]
     - !reference [.fn_tomcat_diff_deploy, script]
     - fn_tomcat_diff_deploy  
     - unzip -o artifacts/diff-deploy-artifacts.zip -d diff-deploy-unpacked

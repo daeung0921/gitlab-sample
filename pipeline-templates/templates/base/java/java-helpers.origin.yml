@@ -3484,9 +3484,7 @@
 
         # [NEW] 현재 배포 커밋 정보(로컬에서 전달)
         : "${CURRENT_COMMIT_SHA:=}"
-      }
 
-      setup_context() {
         APP_NAME="${CONTEXT_PATH#/}"                       # "/devops" → "devops"
         LIVE_LINK="${WEBAPPS_ROOT%/}/${APP_NAME}"
         APP_RELEASES_DIR="${RELEASES_BASE%/}/${APP_NAME}"
@@ -3499,29 +3497,10 @@
         NEW_WAR="${ARTIFACT_ID}-${NEW_VERSION}.war"
         NEW_URL="${BASE_URL}/${NEW_VERSION}/${NEW_WAR}"
 
-        uid="$(id -u)"; gid="$(id -g)"
-        sudo mkdir -p "$REMOTE_DIR" "$ART_DIR"
-        sudo chown -R "$uid:$gid" "$REMOTE_DIR" "$ART_DIR"
-
-        sudo mkdir -p "$RELEASES_BASE" "$APP_RELEASES_DIR"
-        sudo chown "$ARTIFACT_USER:$ARTIFACT_GROUP" "$RELEASES_BASE" "$APP_RELEASES_DIR"
-        sudo chmod 2775 "$RELEASES_BASE" "$APP_RELEASES_DIR"
-
-        sudo touch "$LOG"
-        sudo chmod 777 "$LOG"
-      }
-
-      setup_acl() {
-        uid="$(id -u)"; gid="$(id -g)"
-        sudo setfacl -R -m u:$uid:rwx $RELEASES_BASE
-        sudo setfacl -R -m d:u:$uid:rwx $RELEASES_BASE
-        sudo setfacl -R -m m:rwx $RELEASES_BASE
-        sudo setfacl -R -m d:m:rwx $RELEASES_BASE
-
-        sudo setfacl -R -m u:$ARTIFACT_USER:rwx $REMOTE_DIR
-        sudo setfacl -R -m d:u:$ARTIFACT_USER:rwx $REMOTE_DIR
-        sudo setfacl -R -m m:rwx $REMOTE_DIR
-        sudo setfacl -R -m d:m:rwx $REMOTE_DIR
+        sudo mkdir -p "$REMOTE_DIR" "$ART_DIR" "$APP_RELEASES_DIR" 
+        sudo chown -R "$ARTIFACT_USER:$ARTIFACT_GROUP" "$ART_DIR" 
+        sudo chmod 2775 "$ART_DIR" 
+        sudo -u "$ARTIFACT_USER" sh -c ": > '$(printf %q "$LOG")'" 
       }
 
       # ── 도구 보장 ───────────────────────────────────────
@@ -3554,15 +3533,15 @@
         done
       }
 
-      ensure_artifact_dir() {
+      ensure_owned_dir() { # $1=dir
         sudo mkdir -p "$1"
         sudo chown -R "$ARTIFACT_USER:$ARTIFACT_GROUP" "$1"
+        command -v restorecon >/dev/null 2>&1 && sudo restorecon -R "$1" || true
       }
 
-      chown_artifact_path() { 
-        sudo chown -R "$ARTIFACT_USER:$ARTIFACT_GROUP" "$1" 
-        sudo find "$1" -type d -exec chmod 0755 {} +
-        sudo find "$1" -type f -exec chmod 0644 {} +
+      chown_path() { # $1=path
+        sudo chown -R "$ARTIFACT_USER:$ARTIFACT_GROUP" "$1"
+        command -v restorecon >/dev/null 2>&1 && sudo restorecon -R "$1" || true
       }
 
       # ── NEW(=새 릴리스) 준비 ────────────────────────────
@@ -3575,8 +3554,7 @@
         sudo chmod 2775 "$RELEASES_BASE" "$APP_RELEASES_DIR"
 
         log "Download NEW: $NEW_URL"
-        sudo mkdir -p  "$tmp_dir"
-        chown_artifact_path "$tmp_dir"
+        ensure_owned_dir "$tmp_dir"
 
         # WAR 다운로드는 루트로 받아도 OK → 이후 소유권 정리
         sudo curl -fsS -u "$NEXUS_USER:$NEXUS_PASS" -o "$tmp_dir/$NEW_WAR" "$NEW_URL" \
@@ -3591,7 +3569,7 @@
         sudo mv "$tmp_dir/unzip" "$new_dir"
 
         # 최종 소유권/SELinux 컨텍스트 정리
-        chown_artifact_path "$new_dir"
+        chown_path "$new_dir"
 
         # 표준 권한 정규화: 디렉터리 755, 파일 644 (대부분 WAR에 적합)
         sudo find "$new_dir" -type d -exec chmod 0755 {} +                                  # [ADD]
@@ -3625,12 +3603,12 @@
           log "MIGRATE: moving DIR to legacy: $legacy"
           sudo mv "$LIVE_LINK" "$legacy"
           prev_target="$legacy"
-          chown_artifact_path "$legacy"
+          chown_path "$legacy"
         elif is_any "$LIVE_LINK"; then
           local legacy="${APP_RELEASES_DIR}/${APP_NAME}-legacy-$(ts).file"
           log "MIGRATE: moving FILE to legacy: $legacy"
           sudo mv "$LIVE_LINK" "$legacy"
-          chown_artifact_path "$legacy"
+          chown_path "$legacy"
         else
           log "MIGRATE: nothing to move (first deploy likely)"
         fi
@@ -4206,8 +4184,6 @@
       # ── 메인 ───────────────────────────────────────────
       main() {
         require_env
-        setup_context
-        setup_acl
         ensure_tools
 
         prepare_new_version                     # 새 릴리스 디렉터리 생성
