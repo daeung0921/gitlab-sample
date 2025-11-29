@@ -53,18 +53,30 @@
     - setup_acl ⇒ setup_context 이후에 호출
         
         ```ruby
-        setup_acl() {
-          uid="$(id -u)"; gid="$(id -g)"
-          sudo setfacl -R -m u:$uid:rwx $RELEASES_BASE
-          sudo setfacl -R -m d:u:$uid:rwx $RELEASES_BASE
-          sudo setfacl -R -m m:rwx $RELEASES_BASE
-          sudo setfacl -R -m d:m:rwx $RELEASES_BASE
-        
-          sudo setfacl -R -m u:$ARTIFACT_USER:rwx $REMOTE_DIR
-          sudo setfacl -R -m d:u:$ARTIFACT_USER:rwx $REMOTE_DIR
-          sudo setfacl -R -m m:rwx $REMOTE_DIR
-          sudo setfacl -R -m d:m:rwx $REMOTE_DIR
-        }
+          setup_acl() {
+            uid="$(id -u)"
+            gid="$(id -g)"
+
+            # RELEASES_BASE 체크
+            if ! sudo getfacl -p "$RELEASES_BASE" | grep -q "user:$uid:rwx"; then
+              sudo setfacl -R -m u:$uid:rwx "$RELEASES_BASE"
+              sudo setfacl -R -m d:u:$uid:rwx "$RELEASES_BASE"
+              sudo setfacl -R -m m:rwx "$RELEASES_BASE"
+              sudo setfacl -R -m d:m:rwx "$RELEASES_BASE"
+            else
+              log "$RELEASES_BASE ACL already set for UID $uid, skipping..."
+            fi
+
+            # REMOTE_DIR 체크
+            if ! sudo getfacl -p "$REMOTE_DIR" | grep -q "user:$ARTIFACT_USER:rwx"; then
+              sudo setfacl -R -m u:$ARTIFACT_USER:rwx "$REMOTE_DIR"
+              sudo setfacl -R -m d:u:$ARTIFACT_USER:rwx "$REMOTE_DIR"
+              sudo setfacl -R -m m:rwx "$REMOTE_DIR"
+              sudo setfacl -R -m d:m:rwx "$REMOTE_DIR"
+            else
+              log "$REMOTE_DIR ACL already set for $ARTIFACT_USER, skipping..."
+            fi
+          }
         ```
         
     - change_chown_path ⇒ chown_path 대체 및 chown 코드 대체
