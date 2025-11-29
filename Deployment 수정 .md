@@ -4,7 +4,8 @@
 2. `/opt/tomcat/artifacts` 정리 
 3. nexus 스냅샷 릴리즈 정리
 4. 신규 넥서스 서버로 연결하도록 변경
-5. 함수 변경
+5. predicted.list 관련해서 (특히 jar 쪽에 hooking 함수 점검) predicted.list 가 생성되지 않는 경우가 없는지 확인
+6. 함수 변경
     
     ```ruby
     GREEN="\033[1;32m"
@@ -39,7 +40,7 @@
     }
     ```
     
-6. common.yml 수정
+7. common.yml 수정
     
     ```ruby
     mkdir gitlab_ci_jobs
@@ -48,7 +49,7 @@
     REMOTE_DIR: "/gitlab_ci_jobs/gitlab-ci-${CI_PIPELINE_ID}-${CI_JOB_ID}"
     ```
     
-7. 함수 추가 (모든 deployment 수정)
+8. 함수 추가 (모든 deployment 수정)
     - setup_acl ⇒ setup_context 이후에 호출
         
         ```ruby
@@ -104,7 +105,7 @@
         }
         ```
         
-8. fn_tomcat_symbolic_deploy ⇒ 일단 수정은 하되 rpt 도 diff 로 변경하고 partial deploy 만 끄기 
+9. fn_tomcat_symbolic_deploy ⇒ 일단 수정은 하되 rpt 도 diff 로 변경하고 partial deploy 만 끄기 
     
     ```ruby
     # 함수 수정
