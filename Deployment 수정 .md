@@ -79,14 +79,14 @@
             # path 존재 여부 확인 (sudo 필요할 수도 있음)
             if [ -z "$path" ] || ! sudo test -e "$path"; then
                 echo "ERROR: path does not exist: '$path'" >&2
-                return 1
+                exit 1
             fi
 
             # 위험한 경로는 금지
             case "$path" in
                 /|/etc|/usr|/bin|/sbin|/lib*|/var*)
                     echo "ERROR: unsafe path: '$path'" >&2
-                    return 1
+                    exit 1
                     ;;
             esac
 
