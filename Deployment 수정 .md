@@ -69,6 +69,7 @@
     - change_chown_path ⇒ chown_path 대체 및 chown 코드 대체
         
         ```ruby
+        log()  { printf '[INFO] %s\n' "$*"; }
         change_chown_path() {
             local path="$1"
             local user="$2"
@@ -76,14 +77,14 @@
          
             if [ -z "$path" ] || [ ! -e "$path" ]; then
                 log "ERROR: path does not exist: '$path'" >&2
-                exit 1
+                return 1
             fi
         
             # 위험한 경로는 금지
             case "$path" in
                 /|/etc|/usr|/bin|/sbin|/lib*|/var*)
                     echo "ERROR: unsafe path: '$path'" >&2
-                    exit 1
+                    return 1
                     ;;
             esac
         
