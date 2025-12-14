@@ -1,0 +1,121 @@
+[root@ip-172-31-41-4 tmp]# java -XshowSettings:all -version
+VM settings:
+    Max. Heap Size (Estimated): 934.00M
+    Using VM: OpenJDK 64-Bit Server VM
+
+Property settings:
+    file.encoding = UTF-8
+    file.separator = /
+    java.class.path = 
+    java.class.version = 61.0
+    java.home = /usr/lib/jvm/java-17-openjdk-17.0.16.0.8-2.el8.x86_64
+    java.io.tmpdir = /tmp
+    java.library.path = /usr/java/packages/lib
+        /usr/lib64
+        /lib64
+        /lib
+        /usr/lib
+    java.runtime.name = OpenJDK Runtime Environment
+    java.runtime.version = 17.0.16+8-LTS
+    java.specification.maintenance.version = 1
+    java.specification.name = Java Platform API Specification
+    java.specification.vendor = Oracle Corporation
+    java.specification.version = 17
+    java.vendor = Red Hat, Inc.
+    java.vendor.url = https://www.redhat.com/
+    java.vendor.url.bug = https://access.redhat.com/support/cases/
+    java.vendor.version = (Red_Hat-17.0.16.0.8-1)
+    java.version = 17.0.16
+    java.version.date = 2025-07-15
+    java.vm.compressedOopsMode = 32-bit
+    java.vm.info = mixed mode, sharing
+    java.vm.name = OpenJDK 64-Bit Server VM
+    java.vm.specification.name = Java Virtual Machine Specification
+    java.vm.specification.vendor = Oracle Corporation
+    java.vm.specification.version = 17
+    java.vm.vendor = Red Hat, Inc.
+    java.vm.version = 17.0.16+8-LTS
+    jdk.debug = release
+    line.separator = \n 
+    native.encoding = UTF-8
+    os.arch = amd64
+    os.name = Linux
+    os.version = 4.18.0-305.el8.x86_64
+    path.separator = :
+    sun.arch.data.model = 64
+    sun.boot.library.path = /usr/lib/jvm/java-17-openjdk-17.0.16.0.8-2.el8.x86_64/lib
+    sun.cpu.endian = little
+    sun.io.unicode.encoding = UnicodeLittle
+    sun.java.launcher = SUN_STANDARD
+    sun.jnu.encoding = UTF-8
+    sun.management.compiler = HotSpot 64-Bit Tiered Compilers
+    sun.stderr.encoding = UTF-8
+    sun.stdout.encoding = UTF-8
+    user.country = US
+    user.dir = /tmp
+    user.home = /root
+    user.language = en
+    user.name = root
+
+Locale settings summary:
+    Use "-XshowSettings:locale" option for verbose locale settings options
+    default locale = English (United States)
+    default display locale = English (United States)
+    default format locale = English (United States)
+    tzdata version = 2025b
+
+Security settings summary: 
+    See "java -X" for verbose security settings options
+    Security provider static configuration: (in order of preference)
+        Provider name: SUN
+        Provider name: SunRsaSign
+        Provider name: SunEC
+        Provider name: SunJSSE
+        Provider name: SunJCE
+        Provider name: SunJGSS
+        Provider name: SunSASL
+        Provider name: XMLDSig
+        Provider name: SunPCSC
+        Provider name: JdkLDAP
+        Provider name: JdkSASL
+        Provider name: SunPKCS11
+    Security TLS configuration (SunJSSE provider):
+        Enabled Protocols:
+            TLSv1.3
+            TLSv1.2
+
+Operating System Metrics:
+    Provider: cgroupv1
+    Effective CPU Count: 2
+    CPU Period: 100000us
+    CPU Quota: -1
+    CPU Shares: -1
+    List of Processors, 2 total: 
+    0 1 
+    List of Effective Processors, 2 total: 
+    0 1 
+    List of Memory Nodes, 1 total: 
+    0 
+    List of Available Memory Nodes, 1 total: 
+    0 
+    Memory Limit: Unlimited
+    Memory Soft Limit: Unlimited
+    Memory & Swap Limit: Unlimited
+    Maximum Processes Limit: Unlimited
+
+openjdk version "17.0.16" 2025-07-15 LTS
+OpenJDK Runtime Environment (Red_Hat-17.0.16.0.8-1) (build 17.0.16+8-LTS)
+OpenJDK 64-Bit Server VM (Red_Hat-17.0.16.0.8-1) (build 17.0.16+8-LTS, mixed mode, sharing)
+
+
+[root@ip-172-31-41-4 tmp]# cat EnvDump.java 
+public class EnvDump {
+    public static void main(String[] args) {
+        System.getenv().forEach((k, v) -> {
+            System.out.println(k + "=" + v);
+        });
+    }
+}
+
+[root@ip-172-31-41-4 tmp]# javac EnvDump.java
+[root@ip-172-31-41-4 tmp]# java EnvDump | sort
