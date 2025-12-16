@@ -370,6 +370,11 @@ inCode {
     sub(/[[:space:]]+[0-9]+$/,"",line)
   }
 
+  # 확장 branch 정규화: if*/goto/jsr 계열에서 모든 숫자 오프셋 제거
+  #if (line ~ /^(if[a-z]*|if_icmp[a-z]*|ifnull|ifnonnull|goto|jsr)[[:space:]]+/) {
+  #  gsub(/[[:space:]]+[0-9]+/, "", line)
+  #}
+
   if (NORM_LOCALS==1) {
     if (line ~ /^(aload|astore|iload|istore|lload|lstore|fload|fstore|dload|dstore)_[0-9]+/) {
       sub(/_[0-9]+/,"",line)
