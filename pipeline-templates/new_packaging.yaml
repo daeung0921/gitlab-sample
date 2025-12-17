@@ -1,0 +1,275 @@
+.fn_mvn_deploy_release:
+  script: |
+    fn_mvn_deploy_release() {
+      set -eu
+
+      # ── 필수값 강제 ─────────────────────────────────────────────
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${REMOTE_DEPLOY_HOST:?REMOTE_DEPLOY_HOST is required}"
+      : "${REMOTE_DEPLOY_USER:?REMOTE_DEPLOY_USER is required}"
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+
+      # ── 기본값 ────────────────────────────────────────────────
+      maven_cli_opts="${MAVEN_CLI_OPTS:-"-B"}"
+      remote_port="${REMOTE_DEPLOY_PORT:-22}"
+      remote_settings="${REMOTE_SETTINGS:-""}"
+      src_dir="${CI_PROJECT_DIR:-.}"
+      mvn_debug="${MVN_DEBUG:-false}"
+
+      # ── seed 옵션 (없으면 기존 동작 보존) ─────────────────────────
+      # base.zip(운영 unzip 트리) 다운로드 URL. 없으면 seed 미사용(레거시 유지)
+      base_zip_url="${BASE_ZIP_URL:-""}"
+      nexus_user="${NEXUS_USER:-""}"
+      nexus_pass="${NEXUS_PASS:-""}"
+      # 멀티모듈 WAR 모듈(artifactId == 디렉터리명 가정). seed 주입은 이 모듈에만 적용
+      war_module="${WAR_MODULE:-""}"
+      # 정적파일도 seed로 유지하고 싶으면 1 (기본 0: classes만 주입)
+      inject_static="${INJECT_STATIC:-0}"
+
+      # ── 유틸 ─────────────────────────────────────────────────
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+      shq()  { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+
+      # ── 1) 소스 동기화 (rsync → tar 폴백) ─────────────────────
+      log "▶ Sync sources to remote: $REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$REMOTE_DIR"
+      if command -v rsync >/dev/null 2>&1 && \
+         ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" 'command -v rsync >/dev/null 2>&1'
+      then
+        rsync -az --delete \
+          -e "ssh -p $remote_port" \
+          --rsync-path="mkdir -p '$REMOTE_DIR' && rsync" \
+          --exclude=.git --exclude=.m2 --exclude=target --exclude=node_modules --exclude=.gradle \
+          "$src_dir/" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$REMOTE_DIR/"
+      else
+        tar -C "$src_dir" \
+            --exclude=".git" --exclude=".m2" --exclude="target" \
+            --exclude="node_modules" --exclude=".gradle" \
+            -czf - . \
+          | ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+              "mkdir -p '$REMOTE_DIR' && tar -xzf - -C '$REMOTE_DIR'"
+      fi
+
+      # ── 2) 원격 실행 스크립트 생성 ────────────────────────────
+      remote_script="$(mktemp /tmp/remote_release.XXXXXX)"
+      log "Created temporary remote release script: $remote_script"
+
+      cat > "$remote_script" <<'REMOTE_SH'
+      set -euo pipefail
+      log()  { printf '[INFO] %s\n' "$*"; }
+      ok()   { printf '[OK]   %s\n' "$*"; }
+      fail() { printf '[ERR]  %s\n' "$*" >&2; exit 1; }
+
+      : "${REMOTE_DIR:?REMOTE_DIR is required}"
+      : "${MVN_OPTS:?MVN_OPTS is required}"
+      : "${RELEASE_REPO_URL:?RELEASE_REPO_URL is required}"
+      : "${COMMIT_TAG:?COMMIT_TAG is required}"
+      : "${MVN_DEBUG:?MVN_DEBUG is required}"
+
+      # seed 옵션(없으면 레거시 유지)
+      BASE_ZIP_URL="${BASE_ZIP_URL:-}"
+      NEXUS_USER="${NEXUS_USER:-}"
+      NEXUS_PASS="${NEXUS_PASS:-}"
+      WAR_MODULE="${WAR_MODULE:-}"
+      INJECT_STATIC="${INJECT_STATIC:-0}"
+      SETTINGS_XML="${SETTINGS_XML:-}"
+
+      ARTIFACTS_DIR="$REMOTE_DIR/artifacts"
+      LOG_DIR="$REMOTE_DIR/_logs"
+      DEPLOY_LOG="$ARTIFACTS_DIR/deploy-release-to-registry.log"
+      SEED_LOG="$LOG_DIR/seed.log"
+
+      mkdir -p "$REMOTE_DIR" "$ARTIFACTS_DIR" "$LOG_DIR"
+      cd "$REMOTE_DIR"
+      [ -f "pom.xml" ] || fail "pom.xml not found in $REMOTE_DIR"
+
+      command -v mvn >/dev/null 2>&1 || fail "Maven not installed"
+      command -v zip >/dev/null 2>&1 || fail "zip not installed"
+
+      log "Using Maven : $(command -v mvn)"
+      log "MVN_OPTS   : $MVN_OPTS"
+      log "Release URL: $RELEASE_REPO_URL"
+      log "COMMIT_TAG : $COMMIT_TAG"
+      log "Debug Mode : $MVN_DEBUG"
+      log "BASE_ZIP_URL: ${BASE_ZIP_URL:-<empty>}"
+      log "WAR_MODULE  : ${WAR_MODULE:-<empty>}"
+      log "INJECT_STATIC: $INJECT_STATIC"
+
+      EXTRA_OPTS=""
+      if [ "$MVN_DEBUG" = "true" ]; then
+        EXTRA_OPTS="$EXTRA_OPTS -e -X -DtrimStackTrace=false"
+      fi
+
+      #########################################################################
+      # 0) Seed 주입 (BASE_ZIP_URL 있을 때만)
+      #    - classes: seed/WEB-INF/classes -> <WAR_MODULE>/target/classes
+      #    - optional static/views: seed/static, seed/WEB-INF/views -> <WAR_MODULE>/src/main/webapp/...
+      #########################################################################
+      if [ -n "$BASE_ZIP_URL" ]; then
+        command -v curl  >/dev/null 2>&1 || fail "curl not installed (seed mode)"
+        command -v unzip >/dev/null 2>&1 || fail "unzip not installed (seed mode)"
+        : "${NEXUS_USER:?NEXUS_USER required for seed mode}"
+        : "${NEXUS_PASS:?NEXUS_PASS required for seed mode}"
+        : "${WAR_MODULE:?WAR_MODULE required for seed mode}"
+
+        BASE_ZIP="$REMOTE_DIR/base.zip"
+        SEED_DIR="$REMOTE_DIR/seed"
+        WAR_DIR="$REMOTE_DIR/$WAR_MODULE"
+
+        [ -d "$WAR_DIR" ] || fail "WAR module dir not found: $WAR_DIR (WAR_MODULE=$WAR_MODULE)"
+
+        log "▶ [seed] download base.zip" | tee -a "$SEED_LOG"
+        rm -f "$BASE_ZIP"
+        curl -fSL -u "$NEXUS_USER:$NEXUS_PASS" "$BASE_ZIP_URL" -o "$BASE_ZIP"
+
+        log "▶ [seed] unzip base.zip -> $SEED_DIR" | tee -a "$SEED_LOG"
+        rm -rf "$SEED_DIR"
+        mkdir -p "$SEED_DIR"
+        unzip -q "$BASE_ZIP" -d "$SEED_DIR"
+
+        log "▶ [seed] inject classes -> $WAR_DIR/target/classes" | tee -a "$SEED_LOG"
+        mkdir -p "$WAR_DIR/target/classes"
+        if [ -d "$SEED_DIR/WEB-INF/classes" ]; then
+          cp -a "$SEED_DIR/WEB-INF/classes/." "$WAR_DIR/target/classes/" 2>/dev/null || true
+          log "[seed] class count: $(find "$WAR_DIR/target/classes" -type f 2>/dev/null | wc -l | tr -d ' ')" | tee -a "$SEED_LOG"
+        else
+          log "[seed][WARN] WEB-INF/classes not found in seed. skip classes injection" | tee -a "$SEED_LOG"
+        fi
+
+        if [ "$INJECT_STATIC" = "1" ]; then
+          WEBAPP_DIR="$WAR_DIR/src/main/webapp"
+          mkdir -p "$WEBAPP_DIR"
+
+          if [ -d "$SEED_DIR/static" ]; then
+            log "▶ [seed] inject static -> $WEBAPP_DIR/static" | tee -a "$SEED_LOG"
+            mkdir -p "$WEBAPP_DIR/static"
+            cp -a "$SEED_DIR/static/." "$WEBAPP_DIR/static/" 2>/dev/null || true
+          fi
+
+          if [ -d "$SEED_DIR/WEB-INF/views" ]; then
+            log "▶ [seed] inject views -> $WEBAPP_DIR/WEB-INF/views" | tee -a "$SEED_LOG"
+            mkdir -p "$WEBAPP_DIR/WEB-INF/views"
+            cp -a "$SEED_DIR/WEB-INF/views/." "$WEBAPP_DIR/WEB-INF/views/" 2>/dev/null || true
+          fi
+        fi
+      else
+        log "▶ [seed] BASE_ZIP_URL empty -> legacy build (no seed injection)" | tee -a "$SEED_LOG"
+      fi
+
+      #########################################################################
+      # 1) 버전 세팅 (기존 유지)
+      #########################################################################
+      NEW_VERSION="${COMMIT_TAG#v}"
+      [ -n "$NEW_VERSION" ] || fail "Resolved NEW_VERSION is empty"
+
+      log "▶ Setting version to $NEW_VERSION"
+      if [ -n "$SETTINGS_XML" ]; then
+        mvn $MVN_OPTS $EXTRA_OPTS -s "$SETTINGS_XML" versions:set \
+          -DnewVersion="$NEW_VERSION" -DgenerateBackupPoms=false 2>&1 | tee -a "$DEPLOY_LOG"
+      else
+        mvn $MVN_OPTS $EXTRA_OPTS versions:set \
+          -DnewVersion="$NEW_VERSION" -DgenerateBackupPoms=false 2>&1 | tee -a "$DEPLOY_LOG"
+      fi
+
+      #########################################################################
+      # 2) Release Deploy (clean 제거 가능 옵션화)
+      #    - seed 기반 혼합을 유지하려면 clean을 빼야 함
+      #########################################################################
+      CLEAN_BEFORE_DEPLOY="${CLEAN_BEFORE_DEPLOY:-true}"  # 기본은 기존과 동일하게 true
+      DEPLOY_GOAL="deploy"
+      if [ "$CLEAN_BEFORE_DEPLOY" = "true" ]; then
+        DEPLOY_GOAL="clean deploy"
+      fi
+
+      log "▶ Maven Deploy Release ($DEPLOY_GOAL)"
+      if [ -n "$SETTINGS_XML" ]; then
+        mvn $MVN_OPTS $EXTRA_OPTS -s "$SETTINGS_XML" $DEPLOY_GOAL \
+          -DaltDeploymentRepository="nexus-releases::${RELEASE_REPO_URL}" 2>&1 | tee -a "$DEPLOY_LOG"
+      else
+        mvn $MVN_OPTS $EXTRA_OPTS $DEPLOY_GOAL \
+          -DaltDeploymentRepository="nexus-releases::${RELEASE_REPO_URL}" 2>&1 | tee -a "$DEPLOY_LOG"
+      fi
+      ok "Maven release deploy finished"
+
+      #########################################################################
+      # 3) 산출물 압축 (로그 + (있으면) WAR)
+      #########################################################################
+      OUT_ZIP="$ARTIFACTS_DIR/deploy-release-artifacts.zip"
+      rm -f "$OUT_ZIP"
+
+      # WAR 수집(있으면)
+      WAR_OUT=""
+      if [ -n "${WAR_MODULE:-}" ] && [ -d "$REMOTE_DIR/$WAR_MODULE/target" ]; then
+        WAR_OUT="$(ls -1 "$REMOTE_DIR/$WAR_MODULE/target/"*.war 2>/dev/null | head -n 1 || true)"
+        if [ -n "$WAR_OUT" ]; then
+          cp -a "$WAR_OUT" "$ARTIFACTS_DIR/" || true
+        fi
+      fi
+
+      # -j: 경로 제거
+      if [ -n "${WAR_OUT:-}" ]; then
+        zip -j "$OUT_ZIP" "$DEPLOY_LOG" "$SEED_LOG" "$ARTIFACTS_DIR/$(basename "$WAR_OUT")" >/dev/null 2>&1 || true
+      else
+        zip -j "$OUT_ZIP" "$DEPLOY_LOG" "$SEED_LOG" >/dev/null 2>&1 || true
+      fi
+
+      [ -s "$OUT_ZIP" ] || fail "No deployment artifacts were archived"
+      ok "Packaged: $OUT_ZIP"
+REMOTE_SH
+
+      # ── 3) 원격 실행 (환경 안전 전달) ─────────────────────────
+      log "▶ Executing remote release via SSH: ${REMOTE_DEPLOY_USER}@${REMOTE_DEPLOY_HOST}:${remote_port}"
+      ssh -p "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST" \
+        "REMOTE_DIR='$(shq "$REMOTE_DIR")'" \
+        "MVN_OPTS='$(shq "$maven_cli_opts")'" \
+        "RELEASE_REPO_URL='$(shq "$RELEASE_REPO_URL")'" \
+        "SETTINGS_XML='$(shq "$remote_settings")'" \
+        "COMMIT_TAG='$(shq "$COMMIT_TAG")'" \
+        "MVN_DEBUG='$(shq "$mvn_debug")'" \
+        "BASE_ZIP_URL='$(shq "${base_zip_url}")'" \
+        "NEXUS_USER='$(shq "${nexus_user}")'" \
+        "NEXUS_PASS='$(shq "${nexus_pass}")'" \
+        "WAR_MODULE='$(shq "${war_module}")'" \
+        "INJECT_STATIC='$(shq "${inject_static}")'" \
+        "CLEAN_BEFORE_DEPLOY='$(shq "${CLEAN_BEFORE_DEPLOY:-true}")'" \
+        'export REMOTE_DIR MVN_OPTS RELEASE_REPO_URL SETTINGS_XML COMMIT_TAG MVN_DEBUG BASE_ZIP_URL NEXUS_USER NEXUS_PASS WAR_MODULE INJECT_STATIC CLEAN_BEFORE_DEPLOY; sh -s' \
+        < "$remote_script"
+
+      # ── 4) 산출물 다운로드 ─────────────────────────────────────
+      remote_zip="${REMOTE_DIR}/artifacts/deploy-release-artifacts.zip"
+      local_dir="${CI_PROJECT_DIR:-.}/artifacts"
+      mkdir -p "$local_dir"
+      local_file="$local_dir/$(basename "$remote_zip")"
+
+      log "▶ Downloading artifact: $remote_zip -> $local_file"
+      scp -P "$remote_port" "$REMOTE_DEPLOY_USER@$REMOTE_DEPLOY_HOST:$remote_zip" "$local_file"
+      ok "Done: $local_file"
+
+      # ── 5) 임시 파일 정리 ─────────────────────────────────────
+      rm -f "$remote_script" || true
+      log "Temporary script cleaned up: $remote_script"
+    }
+
+
+------------------------------------
+
+deploy_release_seed_static:
+  stage: deploy
+  script:
+    - fn_mvn_deploy_release
+  variables:
+    COMMIT_TAG: "v1.2.3"
+    RELEASE_REPO_URL: "https://nexus.example.com/repository/maven-releases/"
+    REMOTE_DEPLOY_HOST: "build01.example.com"
+    REMOTE_DEPLOY_USER: "builder"
+    REMOTE_DIR: "/opt/build/myapp"
+
+    BASE_ZIP_URL: "https://nexus.example.com/repository/prod-seed/myapp/prod/base.zip"
+    NEXUS_USER: "nexus_user"
+    NEXUS_PASS: "nexus_pass"
+
+    WAR_MODULE: "webapp"
+    INJECT_STATIC: "1"            # ← static + WEB-INF/views 주입
+    CLEAN_BEFORE_DEPLOY: "false"

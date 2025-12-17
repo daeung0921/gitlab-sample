@@ -4,7 +4,7 @@ set -euo pipefail
 ###############################################################################
 # MODE PARSER
 ###############################################################################
-MODE="safe"
+MODE="aggressive"
 while [ $# -gt 0 ]; do
   case "$1" in
     --mode) MODE="${2:-safe}"; shift 2 ;;
@@ -110,16 +110,13 @@ awk '
   }
 
   /^  interfaces:/ {
-    # 예: "  interfaces: 0, fields: 3, methods: 3, attributes: 1"
     line=$0
     sub(/^  /,"",line)
     header=line
 
-    # 콤마 제거 후 공백 split
     gsub(/,/, "", line)
     split(line, a, /[[:space:]]+/)
 
-    # a: [1]=interfaces: [2]=0 [3]=fields: [4]=3 [5]=methods: [6]=3 [7]=attributes: [8]=1
     ifaceN=a[2]; fieldsN=a[4]; methodsN=a[6]; attrsN=a[8]
   }
 
@@ -178,6 +175,7 @@ awk '
 
 ##############################################################################
 # [5] METHODS (Code normalize with mode + Exception table normalize)
+#     + LocalVariableTable/LocalVariableTypeTable sorted (portable: sort -u)
 ##############################################################################
 echo
 echo "=== METHODS ==="
@@ -193,16 +191,51 @@ BEGIN {
   # meta blocks (per-method)
   inLVT=0; inLVTT=0; inSMT=0;
   smtCtx="";
+
+  tmpseq=0;
+  srand();
 }
 
 function reset_meta() { inLVT=0; inLVTT=0; inSMT=0; smtCtx="" }
 
+function tmpdir(   d) {
+  d = ENVIRON["TMPDIR"]
+  if (d == "") d = "/tmp"
+  return d
+}
+
+function tmpfile(tag,    id) {
+  id = systime() "_" int(rand()*1000000000) "_" (++tmpseq)
+  return tmpdir() "/javapf_" tag "_" id ".txt"
+}
+
+function flush_sorted(file, indent,    cmd) {
+  if (file == "") return
+  if (indent == "") indent = "    "
+  cmd = "sort -u " file " | awk -v pfx='\''" indent "'\'' '\''{print pfx $0}'\''"
+  system(cmd)
+  system("rm -f " file)
+}
+
 # class body enter/exit
 /^\{/ { inBody=1; next }
-/^\}/ { inBody=0; inMethod=0; inCode=0; inEx=0; reset_meta(); next }
+
+/^\}/ {
+  # 열린 테이블이 있으면 flush
+  if (inLVT)  { flush_sorted(lvt_file, "    ");  inLVT=0 }
+  if (inLVTT) { flush_sorted(lvtt_file, "    "); inLVTT=0 }
+
+  inBody=0; inMethod=0; inCode=0; inEx=0;
+  reset_meta()
+  next
+}
 
 # method signature
 inBody && $0 ~ /\);$/ && $1 ~ /^(public|protected|private)/ {
+  # 직전 메서드에서 열린 테이블 flush
+  if (inLVT)  { flush_sorted(lvt_file, "    ");  inLVT=0 }
+  if (inLVTT) { flush_sorted(lvtt_file, "    "); inLVTT=0 }
+
   line=$0
   sub(/^  /,"",line)
 
@@ -220,6 +253,10 @@ inBody && $0 ~ /\);$/ && $1 ~ /^(public|protected|private)/ {
 
 # Code 시작
 inMethod && /Code:/ {
+  # 혹시 열린 테이블이 있으면 flush
+  if (inLVT)  { flush_sorted(lvt_file, "    ");  inLVT=0 }
+  if (inLVTT) { flush_sorted(lvtt_file, "    "); inLVTT=0 }
+
   print "  Code:"
   inCode=1
   inEx=0
@@ -263,46 +300,57 @@ inEx {
   next
 }
 
-# ---- LocalVariableTable (pretty keep: Name + Signature)
+# ---- LocalVariableTable (collect -> sort -u -> print)
 inMethod && /LocalVariableTable:/ {
+  # 이전 LVTT 열려있으면 flush (방어)
+  if (inLVTT) { flush_sorted(lvtt_file, "    "); inLVTT=0 }
+
   print "  LocalVariableTable:"
   inLVT=1; inLVTT=0; inSMT=0; smtCtx=""
+  lvt_file = tmpfile("lvt")
   next
 }
 
 inLVT {
   if ($0 ~ /(LineNumberTable:|LocalVariableTypeTable:|StackMapTable:|MethodParameters:|RuntimeVisibleAnnotations:|RuntimeInvisibleAnnotations:|Exception table:|Code:)/) {
+    flush_sorted(lvt_file, "    ")
     inLVT=0
-    # allow next rule to process current line
+    # fall-through
   } else {
     if ($0 ~ /Start[[:space:]]+Length[[:space:]]+Slot/) next
     n = split($0, f, /[[:space:]]+/)
     if (n >= 6) {
       name = f[5]
       sig  = f[6]
-      if (name != "" && sig != "") print "    " name "  " sig
+      if (name != "" && sig != "") print name "  " sig >> lvt_file
     }
     next
   }
 }
 
-# ---- LocalVariableTypeTable (pretty keep: Name + Signature)
+# ---- LocalVariableTypeTable (collect -> sort -u -> print)
 inMethod && /LocalVariableTypeTable:/ {
+  # 이전 LVT 열려있으면 flush (방어)
+  if (inLVT) { flush_sorted(lvt_file, "    "); inLVT=0 }
+
   print "  LocalVariableTypeTable:"
   inLVTT=1; inLVT=0; inSMT=0; smtCtx=""
+  lvtt_file = tmpfile("lvtt")
   next
 }
 
 inLVTT {
   if ($0 ~ /(LineNumberTable:|LocalVariableTable:|StackMapTable:|MethodParameters:|RuntimeVisibleAnnotations:|RuntimeInvisibleAnnotations:|Exception table:|Code:)/) {
+    flush_sorted(lvtt_file, "    ")
     inLVTT=0
+    # fall-through
   } else {
     if ($0 ~ /Start[[:space:]]+Length[[:space:]]+Slot/) next
     n = split($0, f, /[[:space:]]+/)
     if (n >= 6) {
       name = f[5]
       sig  = f[6]
-      if (name != "" && sig != "") print "    " name "  " sig
+      if (name != "" && sig != "") print name "  " sig >> lvtt_file
     }
     next
   }
@@ -310,6 +358,10 @@ inLVTT {
 
 # ---- StackMapTable (pretty keep: locals/stack types only)
 inMethod && /StackMapTable:/ {
+  # 열린 테이블 flush
+  if (inLVT)  { flush_sorted(lvt_file, "    ");  inLVT=0 }
+  if (inLVTT) { flush_sorted(lvtt_file, "    "); inLVTT=0 }
+
   print "  StackMapTable:"
   inSMT=1; inLVT=0; inLVTT=0; smtCtx=""
   next
@@ -355,26 +407,50 @@ inCode {
   sub(/^[[:space:]]+/,"",line)
   sub(/[[:space:]]+$/,"",line)
 
+  # stack/locals/args_size 라인은 드롭
   if (DROP_STACK==1 && line ~ /^stack=[0-9]+,[[:space:]]*locals=[0-9]+,[[:space:]]*args_size=[0-9]+$/) next
 
+  # "12: " 같은 PC 제거
   sub(/^[0-9]+:[[:space:]]*/,"",line)
 
+  # opcode 정규화
   gsub(/ldc_w/,"ldc",line)
+
+  # Constant pool 토큰(#123) 제거
   gsub(/#[0-9]+/,"",line)
 
+  # invokeinterface 마지막 operand(count) 제거 (이미 있던 로직)
   if (NORM_IFACE==1) {
     sub(/^invokeinterface([[:space:]]*,)?[[:space:]]*[0-9]+/,"invokeinterface",line)
   }
 
+  # ---- invokedynamic 정규화 (형식 무관: "#n, 0" / "n" / ", 0" 전부 처리)
+  # 목적: invokedynamic operand(인덱스/카운트 등) 노이즈 제거
+  #       주석("// ...")은 유지
+  if (line ~ /^invokedynamic/) {
+    cpos = index(line, "//")
+    if (cpos > 0) {
+      pre  = substr(line, 1, cpos-1)
+      post = substr(line, cpos)          # "// ..." 유지
+      sub(/^[[:space:]]+/, "", pre)
+      pre = "invokedynamic"              # operand 전부 제거
+      line = pre " " post
+    } else {
+      line = "invokedynamic"
+    }
+  }
+  
+  # 짧은 branch(마지막이 숫자 오프셋인 케이스) 제거 (기존 로직)
   if (line ~ /^(if[a-z]*|goto|jsr|ifnull|ifnonnull)[[:space:]]+[0-9]+$/) {
     sub(/[[:space:]]+[0-9]+$/,"",line)
   }
 
-  # 확장 branch 정규화: if*/goto/jsr 계열에서 모든 숫자 오프셋 제거
-  #if (line ~ /^(if[a-z]*|if_icmp[a-z]*|ifnull|ifnonnull|goto|jsr)[[:space:]]+/) {
-  #  gsub(/[[:space:]]+[0-9]+/, "", line)
-  #}
+  # 확장 branch 정규화: if*/goto/jsr 계열에서 모든 숫자 오프셋 제거 (기존 로직)
+  if (line ~ /^(if[a-z]*|if_icmp[a-z]*|ifnull|ifnonnull|goto|jsr)[[:space:]]+/) {
+    gsub(/[[:space:]]+[0-9]+/, "", line)
+  }
 
+  # local slot 정규화 (aggressive에서만)
   if (NORM_LOCALS==1) {
     if (line ~ /^(aload|astore|iload|istore|lload|lstore|fload|fstore|dload|dstore)_[0-9]+/) {
       sub(/_[0-9]+/,"",line)
@@ -384,6 +460,7 @@ inCode {
     }
   }
 
+  # 공백 정리
   gsub(/[[:space:]]+/," ",line)
   sub(/^[[:space:]]+/,"",line)
   sub(/[[:space:]]+$/,"",line)
@@ -391,12 +468,16 @@ inCode {
   if (line != "") print "    " line
   next
 }
+
+END {
+  # 혹시 열린 테이블이 남아있으면 flush
+  if (inLVT)  flush_sorted(lvt_file, "    ")
+  if (inLVTT) flush_sorted(lvtt_file, "    ")
+}
 ' "$tmp_in"
 
-
-
 ##############################################################################
-# [6] STRING CONSTANTS
+# [6] STRING CONSTANTS  (already sorted)
 ##############################################################################
 echo
 echo "=== STRING CONSTANTS ==="
@@ -415,23 +496,50 @@ awk '
   }
 ' "$tmp_in" | sort -u
 
-
 ##############################################################################
 # [7] SAFETY CHECK: BootstrapMethods / InnerClasses signal extraction
+#     + InnerClasses sorted (portable: sort -u)
 ##############################################################################
 echo
 echo "=== BOOTSTRAP/INNER SAFETY SIGNALS ==="
 
 awk '
-  BEGIN { inBoot=0; inInner=0; inArgs=0; saw=0 }
+  BEGIN {
+    inBoot=0; inInner=0; inArgs=0;
+    sawBoot=0; sawInner=0;
+    tmpseq=0;
+    srand();
+  }
+
+  function tmpdir(   d) {
+    d = ENVIRON["TMPDIR"]
+    if (d == "") d = "/tmp"
+    return d
+  }
+
+  function tmpfile(tag,    id) {
+    id = systime() "_" int(rand()*1000000000) "_" (++tmpseq)
+    return tmpdir() "/javapf_" tag "_" id ".txt"
+  }
+
+  function flush_inner(file,    cmd) {
+    if (file == "") return
+    cmd = "sort -u " file " | awk '\''{print \"  \" $0}'\''"
+    system(cmd)
+    system("rm -f " file)
+  }
 
   /^[[:space:]]*BootstrapMethods:/ {
-    inBoot=1; inInner=0; inArgs=0; saw=1;
+    if (inInner) { flush_inner(inner_file); inInner=0 }
+    inBoot=1; inInner=0; inArgs=0; sawBoot=1;
     print "BootstrapMethods:"
     next
   }
+
   /^[[:space:]]*InnerClasses:/ {
-    inInner=1; inBoot=0; inArgs=0; saw=1;
+    if (inInner) { flush_inner(inner_file) }
+    inInner=1; inBoot=0; inArgs=0; sawInner=1;
+    inner_file = tmpfile("inner")
     print "InnerClasses:"
     next
   }
@@ -440,12 +548,13 @@ awk '
 
   # 다른 섹션 헤더로 넘어가면 종료
   (inBoot || inInner) && /^[[:space:]]*(Constant pool:|\{|SourceFile:|Signature:|EnclosingMethod:|NestMembers:|PermittedSubclasses:|RuntimeVisibleAnnotations:|RuntimeInvisibleAnnotations:)/ {
-    inBoot=0; inInner=0; inArgs=0
+    if (inInner) { flush_inner(inner_file); inInner=0 }
+    inBoot=0; inArgs=0
     next
   }
 
   ####################################################################
-  # BootstrapMethods
+  # BootstrapMethods (streaming)
   ####################################################################
   inBoot {
     line=$0
@@ -455,29 +564,25 @@ awk '
     sub(/^[[:space:]]+/,"",line)
     sub(/[[:space:]]+$/,"",line)
 
-    # "0:" 같은 엔트리 시작을 만나면 args 컨텍스트 리셋
     if (line ~ /^[0-9]+:[[:space:]]*/) {
       inArgs=0
-      sub(/^[0-9]+:[[:space:]]*/,"",line)   # ← 엔트리 번호(예: 0:) 제거
+      sub(/^[0-9]+:[[:space:]]*/,"",line)
       print "  " line
       next
     }
 
-    # Method arguments 시작
     if (line ~ /^Method arguments:/) {
       inArgs=1
       print "    Method arguments:"
       next
     }
 
-    # REF_* 라인: args 내부면 더 깊게 들여쓰기
     if (line ~ /REF_[A-Za-z0-9][A-Za-z0-9]*/) {
       if (inArgs==1) print "      " line
       else          print "  " line
       next
     }
 
-    # MethodType 라인: args 내부에서만 출력
     if (inArgs==1 && line ~ /^\(\).+;$/) {
       print "      " line
       next
@@ -487,7 +592,7 @@ awk '
   }
 
   ####################################################################
-  # InnerClasses
+  # InnerClasses (collect -> sort -u -> print)
   ####################################################################
   inInner {
     idx=index($0,"//")
@@ -495,12 +600,13 @@ awk '
       s=substr($0, idx+2)
       gsub(/^[[:space:]]+/,"",s)
       gsub(/[[:space:]]+$/,"",s)
-      if (s != "") print "  " s
+      if (s != "") print s >> inner_file
     }
     next
   }
 
   END {
-    if (!saw) print "(no BootstrapMethods/InnerClasses found)"
+    if (inInner) flush_inner(inner_file)
+    if (!sawBoot && !sawInner) print "(no BootstrapMethods/InnerClasses found)"
   }
 ' "$tmp_in"
